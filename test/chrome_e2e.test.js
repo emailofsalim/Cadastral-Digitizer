@@ -656,9 +656,24 @@ async function importPdfThroughUi(page, pdfPath) {
   // Generous: this is where 1.4 MB of PDF.js is injected into the page world,
   // parsed, and asked to rasterise a page at 2400 px on its long edge.
   await page.waitForSelector('#bnd15-raster-workspace', { timeout: 45000 });
+  // Waits for THIS file by name, not merely for a workspace to exist. A second
+  // import lands on a page that already has one, so every generic condition is
+  // already true and waiting on one would race the render it is meant to await.
   await page.waitForFunction(
-    () => /px/.test(document.querySelector('#bnd15-widget').textContent),
-    null, { timeout: 15000 });
+    (n) => document.querySelector('#bnd15-widget').textContent.includes(n),
+    path.basename(pdfPath), { timeout: 45000 });
+}
+
+/* Open the drawing section, where the page selector lives — but only if it is
+ * closed. Whether it already is depends on which tests ran before this one:
+ * the open/closed state is a persisted setting, and every test in this file
+ * shares one browser profile. Toggling blindly would close it half the time. */
+async function openDrawingSection(page) {
+  const sel = '#bnd15-widget details[data-sect="drawing"]';
+  await page.waitForSelector(sel, { timeout: 10000 });
+  const isOpen = await page.$eval(sel, (el) => el.open);
+  if (!isOpen) await page.click(`${sel} > summary`);
+  await page.waitForSelector('#bnd15-widget #pdfNext', { state: 'visible', timeout: 10000 });
 }
 
 t('a picked PDF is rendered by the extension itself and reaches the raster workspace', async () => {
@@ -740,10 +755,8 @@ t('turning a page of a multi-page PDF replaces the sheet and keeps the digitised
   assert.strictEqual(before, '4', 'the drawn parcel should have four corners');
 
   // The page selector lives inside the drawing section, which is collapsed
-  // until asked for. Real Chrome will not click through a closed <details>, so
-  // it is opened the way an operator opens it.
-  await page.click('#bnd15-widget details[data-sect="drawing"] > summary');
-  await page.waitForSelector('#bnd15-widget #pdfNext', { state: 'visible', timeout: 10000 });
+  // until asked for. Real Chrome will not click through a closed <details>.
+  await openDrawingSection(page);
 
   // Turn the page.
   await page.click('#bnd15-widget #pdfNext');
@@ -771,6 +784,92 @@ t('turning a page of a multi-page PDF replaces the sheet and keeps the digitised
     `the digitised parcel must survive a page turn: ${after.slice(0, 400)}`);
   assert.match(after, /three-page-sheet\.pdf — page 2 of 3/,
     'the sheet label should name the page being digitised');
+});
+
+t('a PDF import that fails leaves the sheet already open exactly as it was', async () => {
+  const { page } = await openFixtureWithExtension();
+  const good = path.join(tmpRoot, 'good-sheet.pdf');
+  fs.writeFileSync(good, Buffer.from(minimalPdf(3), 'latin1'));
+  await importPdfThroughUi(page, good);
+  await openDrawingSection(page);
+  assert.match(await page.textContent('#bnd15-widget'), /PDF page 1 of 3/);
+
+  // A portal answering a download with its login page, saved as .pdf. The
+  // realistic version of "that file is not what it says it is".
+  const bad = path.join(tmpRoot, 'not-really.pdf');
+  fs.writeFileSync(bad, '<!DOCTYPE html><html><body>Session expired</body></html>');
+
+  const chooser = page.waitForEvent('filechooser', { timeout: 20000 });
+  await page.click('#bnd15-widget #btnImport');
+  await page.click('#bnd15-widget #iPdf');
+  (await chooser).setFiles(bad);
+
+  await page.waitForFunction(
+    () => /is not a PDF/.test((document.getElementById('bnd15-toasts') || {}).textContent || ''),
+    null, { timeout: 20000 });
+
+  // The refusal must cost the operator nothing. A failed import that quietly
+  // destroyed the document already open would leave the sheet on screen with
+  // its page selector gone — the picture still there, the navigation not.
+  await openDrawingSection(page);
+  const text = await page.textContent('#bnd15-widget');
+  assert.match(text, /PDF page 1 of 3/,
+    `the open document must survive a failed import: ${text.slice(0, 400)}`);
+  assert.match(text, /good-sheet\.pdf/, 'the sheet on screen is still the good one');
+
+  // And it is still a live document, not just a stale label: it can be paged.
+  await page.click('#bnd15-widget #pdfNext');
+  await page.waitForFunction(
+    () => /PDF page 2 of 3/.test(document.querySelector('#bnd15-widget').textContent),
+    null, { timeout: 30000 });
+  const blue = await page.evaluate(COUNT_IN_WORKSPACE, PDF_PAGE_COLOURS[1].rgb);
+  assert.ok(blue.hits > 20000,
+    `page 2 must still render after the failed import; found ${blue.hits} pixels`);
+});
+
+t('importing repeatedly replaces the sheet each time and leaves nothing behind', async () => {
+  const { page } = await openFixtureWithExtension();
+
+  const three = path.join(tmpRoot, 'repeat-three.pdf');
+  const one = path.join(tmpRoot, 'repeat-one.pdf');
+  fs.writeFileSync(three, Buffer.from(minimalPdf(3), 'latin1'));
+  fs.writeFileSync(one, Buffer.from(minimalPdf(1), 'latin1'));
+
+  await importPdfThroughUi(page, three);
+  assert.match(await page.textContent('#bnd15-widget'), /PDF page 1 of 3/);
+
+  // A second PDF over the first. The page selector must describe the document
+  // that is actually open, not the one that was.
+  await importPdfThroughUi(page, one);
+  const afterSecond = await page.textContent('#bnd15-widget');
+  assert.match(afterSecond, /repeat-one\.pdf/, 'the second file is the one on screen');
+  assert.ok(!/PDF page 1 of 3/.test(afterSecond),
+    `a single-page PDF must not inherit the previous document's page selector: ${afterSecond.slice(0, 400)}`);
+
+  // Then an image over the PDF. The selector must go entirely — there is no
+  // document to page through any more.
+  const png = path.join(tmpRoot, 'sheet.png');
+  fs.writeFileSync(png, Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAIAAAD/gAIDAAAAV0lEQVR4nO3BAQ0AAADCoPdPbQ8H'
+    + 'FAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    + 'AAAAAAAAAAAA8G1gAAABmmDvyAAAAABJRU5ErkJggg==', 'base64'));
+
+  const chooser = page.waitForEvent('filechooser', { timeout: 20000 });
+  await page.click('#bnd15-widget #btnImport');
+  await page.click('#bnd15-widget #iImage');
+  (await chooser).setFiles(png);
+  await page.waitForFunction(
+    () => /sheet\.png/.test(document.querySelector('#bnd15-widget').textContent),
+    null, { timeout: 30000 });
+
+  const afterImage = await page.textContent('#bnd15-widget');
+  assert.ok(!/PDF page/.test(afterImage),
+    `an image replacing a PDF must retire the page selector: ${afterImage.slice(0, 400)}`);
+
+  // Three imports, one workspace. Each mount destroys its predecessor rather
+  // than stacking another element with the same id on top of it.
+  const containers = await page.$$eval('[id="bnd15-raster-workspace"]', (els) => els.length);
+  assert.strictEqual(containers, 1, `three imports left ${containers} workspaces behind`);
 });
 
 /* =====================================================================

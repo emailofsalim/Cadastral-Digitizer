@@ -2121,6 +2121,13 @@
     }
     if (!file) return;
 
+    /* The document this call opens, held separately from st.pdf until it is
+     * known to be good. A failed import must cost the operator nothing: the
+     * PDF already open stays open, still paginated, still theirs. Closing the
+     * old one before the new one has parsed would mean picking the wrong file
+     * by accident destroys the right one — the same ownership-transfer care
+     * openWorkspace takes with the object URL it mints. */
+    let opened = null;
     try {
       st.busy = true; renderWidget();
       toast('Loading PDF…', 'info', 4000);
@@ -2136,14 +2143,16 @@
       // isEvalSupported:false keeps PDF.js off eval, which some portals forbid
       // outright through their Content-Security-Policy.
       const task = pdfjsLib.getDocument({ data: bytes, isEvalSupported: false });
-      let doc;
       try {
-        doc = await task.promise;
+        opened = await task.promise;
       } catch (err) {
         throw new Error(describePdfError(err));
       }
-      if (!doc || !doc.numPages) throw new Error('This PDF has no pages to render.');
+      if (!opened || !opened.numPages) throw new Error('This PDF has no pages to render.');
 
+      // The new document is good. Only now does the old one go.
+      const doc = opened;
+      opened = null;                 // ownership transferred; the catch must not destroy it
       closePdfDocument();
       st.pdf = { doc, pageCount: doc.numPages, pageNumber: 1, fileName: file.name, renderTask: null };
       await renderPdfPage(1, { preserveSession: false });
@@ -2152,7 +2161,9 @@
         toast(`${doc.numPages} pages. Use the page selector to choose another; your digitised parcels are kept when you turn a page.`, 'info', 9000);
       }
     } catch (err) {
-      closePdfDocument();
+      // Release only what this call opened. A document that parsed and then
+      // failed later still holds its whole byte buffer.
+      if (opened) { safe(() => opened.destroy()); opened = null; }
       toastErr(String(err && err.message ? err.message : err));
     } finally {
       st.busy = false;
