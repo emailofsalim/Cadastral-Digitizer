@@ -34,9 +34,39 @@ const ROOT = path.join(__dirname, '..');
 let chromium = null;
 try { chromium = require('playwright-core').chromium; } catch (e) { /* optional */ }
 
-const CHROME = ['/usr/local/bin/chrome', '/opt/playwright/chromium-1232/chrome-linux64/chrome',
-  '/usr/bin/google-chrome', '/usr/bin/chromium']
-  .find((p) => { try { return fs.existsSync(p); } catch (e) { return false; } });
+/* WHICH BROWSER, AND WHY NOT THE INSTALLED GOOGLE CHROME
+ *
+ * These tests need a browser that can load an UNPACKED extension. From Chrome
+ * 137 the stable channel refuses `--load-extension` in headless mode, so an
+ * installed google-chrome silently loads nothing: chrome://extensions lists
+ * zero items, no service worker ever registers, and every test here times out
+ * waiting for one. Measured on Chrome 152, with
+ * --disable-features=DisableLoadExtensionCommandLineSwitch and
+ * --headless=new both tried and neither helping.
+ *
+ * Playwright's own Chromium build has no such restriction, and is the same
+ * engine — real rasterisation, real MV3 service workers, real tab capture —
+ * so nothing about the coverage is weakened by preferring it. It is therefore
+ * looked for FIRST, and an installed Chrome is kept only as a last resort for
+ * an older build that can still do the job.
+ *
+ * Get one with:  npx playwright install chromium
+ */
+const CHROME = (() => {
+  const exists = (p) => { try { return !!p && fs.existsSync(p); } catch (e) { return false; } };
+  const candidates = [];
+  // Playwright's own build, wherever this installation keeps it.
+  try { candidates.push(chromium && chromium.executablePath()); } catch (e) { /* not installed */ }
+  // Some images stage it under a stable symlink rather than a versioned path.
+  if (process.env.PLAYWRIGHT_BROWSERS_PATH) {
+    candidates.push(path.join(process.env.PLAYWRIGHT_BROWSERS_PATH, 'chromium'));
+  }
+  candidates.push('/opt/pw-browsers/chromium', '/usr/bin/chromium',
+    // Last: an installed Chrome. Fine if it predates the headless restriction,
+    // and it fails with an explicit message in launch() if it does not.
+    '/usr/local/bin/chrome', '/usr/bin/google-chrome');
+  return candidates.find(exists);
+})();
 
 const enabled = !!(chromium && CHROME);
 const t = enabled ? test : test.skip;
@@ -88,10 +118,29 @@ function launch() {
       ],
       viewport: { width: 1100, height: 800 },
     });
-    let [sw] = ctx.serviceWorkers();
-    if (!sw) sw = await ctx.waitForEvent('serviceworker', { timeout: 20000 });
-    sharedSw = sw;
+    // Registered for cleanup IMMEDIATELY, before anything that can throw.
+    //
+    // This line used to sit below the waitForEvent, and that was the whole of
+    // the CI hang: when the service worker never arrived, the timeout threw
+    // past the push, the browser was never closed by `after`, and the runner
+    // sat with a live Chrome holding its event loop open until the job was
+    // killed. --test-force-exit was removed in 16.3.0, so an unclosed handle
+    // is not a slow suite, it is an infinite one. A launch that fails must
+    // still leave a closable browser behind.
     allContexts.push(ctx);
+    let [sw] = ctx.serviceWorkers();
+    if (!sw) {
+      sw = await ctx.waitForEvent('serviceworker', { timeout: 20000 }).catch(() => null);
+    }
+    if (!sw) {
+      throw new Error(
+        `The extension's service worker never registered in ${CHROME}. `
+        + 'That browser could not load the unpacked extension — Chrome refuses '
+        + '--load-extension in headless mode from version 137, so the suite needs '
+        + "Playwright's own Chromium rather than an installed Google Chrome. "
+        + 'Run: npx playwright install chromium');
+    }
+    sharedSw = sw;
     return { ctx, sw, extId: new URL(sw.url()).host };
   })();
   return launching;

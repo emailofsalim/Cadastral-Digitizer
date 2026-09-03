@@ -1232,3 +1232,48 @@ test('R16g: the end-to-end suite drives the extension over http, never file://',
   assert.match(code, /fixtureServer\.unref\(\)/,
     'and the listening socket must not be able to hold the runner open');
 });
+
+test('R16h: a failed browser launch cannot leave the test runner hanging', () => {
+  // This was the CI hang. The launch helper registered its browser context for
+  // cleanup only AFTER waiting for the extension's service worker, so when that
+  // wait timed out the throw skipped the registration, `after` closed nothing,
+  // and a live Chrome held Node's event loop open until the job was killed.
+  // --test-force-exit was removed in 16.3.0, so an unclosed handle is not a
+  // slow suite -- it is an infinite one.
+  const e2e = read('test/chrome_e2e.test.js');
+  // Comments stripped first: the explanation above the fix necessarily names
+  // waitForEvent, and matching that instead of the call would make this test
+  // pass on the prose rather than on the code.
+  const launch = e2e.match(/function launch\(\)[\s\S]*?\n\}/)[0]
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  const pushAt = launch.indexOf('allContexts.push(ctx)');
+  const waitAt = launch.indexOf('waitForEvent');
+  assert.ok(pushAt > 0, 'the launched context must be registered for cleanup');
+  assert.ok(waitAt > 0, 'the service-worker wait must still be there');
+  assert.ok(pushAt < waitAt,
+    'the context must be registered for cleanup BEFORE anything that can throw, '
+    + 'or a failed launch leaks a browser and hangs the runner');
+});
+
+test('R16i: the E2E suite prefers a browser that can load an unpacked extension', () => {
+  // Chrome 137+ refuses --load-extension headlessly, so an installed
+  // google-chrome silently loads nothing: chrome://extensions lists zero items
+  // and no service worker ever appears. Playwright's Chromium has no such
+  // restriction, so it must be looked for first and Chrome kept as a fallback.
+  const e2e = read('test/chrome_e2e.test.js');
+  const block = e2e.match(/const CHROME = \(\(\) => \{[\s\S]*?\}\)\(\);/);
+  assert.ok(block, 'browser discovery must be explicit about its ordering');
+  const src = block[0];
+  const pw = src.indexOf('chromium.executablePath()');
+  const chrome = src.indexOf('google-chrome');
+  assert.ok(pw > 0 && chrome > 0, 'both candidates should be considered');
+  assert.ok(pw < chrome,
+    "Playwright's Chromium must be preferred over an installed Google Chrome");
+  // And the failure must name the remedy rather than timing out anonymously.
+  assert.match(e2e, /npx playwright install chromium/);
+
+  // CI must install that browser rather than relying on the runner's Chrome.
+  const wf = read('.github/workflows/test.yml');
+  assert.match(wf, /npx playwright install --with-deps chromium/);
+});
