@@ -213,6 +213,9 @@
     // Blob URL backing the open sheet, when the file picker minted one. Held so
     // it can be revoked; an unreleased object URL pins the whole file.
     workspaceUrl: null,
+    // The open PDF: { doc, pageCount, pageNumber, fileName, renderTask }.
+    // Only the active page is ever rendered.
+    pdf: null,
     mapAdapter: null,            // the live-map adapter, kept for restoring
     georef: null,                // { fit, crs, rms, looRms, residuals } pixel -> CRS
     georefPoints: [],            // [{ id, pixel:[x,y], world:[x,y], enabled }]
@@ -1994,6 +1997,9 @@
       'Opening an image workspace switches the coordinate system to image pixels.\n\n' +
       `You have ${st.shapes.length} shape(s) digitised against the current map. Export or save them first if you need them — continue?`)) return;
 
+    // An image replacing a PDF means that document is finished with; it holds
+    // its whole byte buffer until destroyed.
+    closePdfDocument();
     let url = null, name = 'image', kind = source;
     // Only a URL WE minted needs revoking. A capture is a data: URL and a page
     // image belongs to the page; calling revoke on either would be meaningless
@@ -2030,30 +2036,8 @@
       const loaded = await Raster.loadImageSource(document, url);
       if (!loaded.ok) throw new Error(loaded.error);
 
-      const made = Raster.createRasterWorkspace({
-        doc: document, win: window, Viewport,
-        image: loaded.image, sourceName: name, sourceKind: kind,
-      });
-      if (!made.ok) throw new Error(made.error);
-
-      // Park the live-map adapter rather than discarding it, so closing the
-      // workspace returns to exactly where the operator was.
-      if (!st.workspace) st.mapAdapter = st.adapter;
-      // The sheet being replaced no longer needs its blob URL, and an object
-      // URL pins the whole file in memory until it is revoked or the page goes
-      // away. Repeated imports would otherwise accumulate every sheet ever
-      // opened.
-      releaseWorkspaceUrl();
-      st.workspaceUrl = mintedUrl;
+      mountRaster(loaded.image, name, kind, { objectUrl: mintedUrl });
       mintedUrl = null;              // ownership transferred; the catch must not revoke it
-      teardownSurface();
-      st.workspace = made.adapter;
-      st.adapter = made.adapter;
-      clearSessionState();
-      st.crs = null; st.crsDetection = null;
-      ensureOverlay(); installGestures();
-      applyDrawingStyle();
-      autosave(); renderWidget(); draw();
       toastOk(`${name} opened — ${loaded.image.width}×${loaded.image.height} px. Trace as usual; coordinates are image pixels until you georeference.`);
       if (kind === 'capture') {
         toast('A capture is at screen resolution, not the source resolution. For a large sheet, zoom in and capture in sections.', 'info', 9000);
@@ -2066,6 +2050,243 @@
       st.busy = false;
       renderWidget();
     }
+  }
+
+  /* =====================================================================
+   * PDF IMPORT
+   * ---------------------------------------------------------------------
+   * The operator picks the actual PDF file and the extension renders it
+   * itself. Chrome's own PDF viewer is not involved at any point: an extension
+   * cannot read pixels out of PDFium, and a screenshot of it is limited to
+   * whatever is on screen at screen resolution — fine as a fallback for a
+   * cross-origin canvas, wrong as the way to digitize a cadastral sheet.
+   *
+   * PDF.js is vendored in vendor/ and injected on demand by the service
+   * worker, so nothing is fetched from a CDN and the whole path works offline.
+   * A rendered page becomes an ordinary canvas and goes through mountRaster,
+   * which is the same hand-off a picked image uses — the workspace never
+   * learns that a PDF was involved.
+   * =================================================================== */
+  function requestPdfJs() {
+    return new Promise((resolve) => {
+      const token = 'p' + Date.now() + Math.random().toString(36).slice(2);
+      const onRes = (e) => {
+        const d = e && e.detail;
+        if (!d || d.token !== token) return;
+        window.removeEventListener('BND15_PDFJS_RES', onRes);
+        resolve(d);
+      };
+      window.addEventListener('BND15_PDFJS_RES', onRes);
+      window.dispatchEvent(new CustomEvent('BND15_PDFJS_REQ', { detail: { token } }));
+      setTimeout(() => {
+        window.removeEventListener('BND15_PDFJS_RES', onRes);
+        resolve({ ok: false, error: 'The extension worker did not answer. Reopen the digitizer from the toolbar button and try again.' });
+      }, 15000);
+    });
+  }
+
+  /* Load the renderer once per page. Asking twice is harmless but pointless. */
+  async function ensurePdfJs() {
+    if (window.pdfjsLib) return window.pdfjsLib;
+    const res = await requestPdfJs();
+    if (!res.ok) throw new Error(res.error);
+    if (!window.pdfjsLib) {
+      throw new Error('The PDF renderer loaded but did not register itself. Reopen the digitizer and try again.');
+    }
+    return window.pdfjsLib;
+  }
+
+  /* Release the document and any render in flight. Called before opening
+   * another file and when the workspace closes: a PDF document holds its whole
+   * byte buffer, and an abandoned render task keeps working on a page nobody
+   * is waiting for. */
+  function closePdfDocument() {
+    if (!st.pdf) return;
+    safe(() => { if (st.pdf.renderTask) st.pdf.renderTask.cancel(); });
+    safe(() => { if (st.pdf.doc) st.pdf.doc.destroy(); });
+    st.pdf = null;
+  }
+
+  async function importPdfFile() {
+    st.openMenu = null;
+    if (st.shapes.length && !confirm(
+      'Opening a PDF switches the coordinate system to image pixels.\n\n'
+      + `You have ${st.shapes.length} shape(s) digitised against the current map. Export or save them first if you need them — continue?`)) return;
+
+    let file = null;
+    try {
+      file = await readFile('application/pdf,.pdf', 'arrayBuffer');
+    } catch (e) {
+      return toastErr('That file could not be read.');
+    }
+    if (!file) return;
+
+    try {
+      st.busy = true; renderWidget();
+      toast('Loading PDF…', 'info', 4000);
+
+      const bytes = new Uint8Array(file.data);
+      // Extensions and MIME types are both routinely wrong on files that arrive
+      // by email or a messaging app, so the bytes decide.
+      if (!Imp.looksLikePdfBytes(bytes)) {
+        throw new Error('That file is not a PDF. Its name or type may say otherwise, but the contents are something else.');
+      }
+
+      const pdfjsLib = await ensurePdfJs();
+      // isEvalSupported:false keeps PDF.js off eval, which some portals forbid
+      // outright through their Content-Security-Policy.
+      const task = pdfjsLib.getDocument({ data: bytes, isEvalSupported: false });
+      let doc;
+      try {
+        doc = await task.promise;
+      } catch (err) {
+        throw new Error(describePdfError(err));
+      }
+      if (!doc || !doc.numPages) throw new Error('This PDF has no pages to render.');
+
+      closePdfDocument();
+      st.pdf = { doc, pageCount: doc.numPages, pageNumber: 1, fileName: file.name, renderTask: null };
+      await renderPdfPage(1, { preserveSession: false });
+
+      if (doc.numPages > 1) {
+        toast(`${doc.numPages} pages. Use the page selector to choose another; your digitised parcels are kept when you turn a page.`, 'info', 9000);
+      }
+    } catch (err) {
+      closePdfDocument();
+      toastErr(String(err && err.message ? err.message : err));
+    } finally {
+      st.busy = false;
+      renderWidget();
+    }
+  }
+
+  /* PDF.js reports failures by exception name. Turned into something an
+   * operator can act on, rather than shown raw (brief R). */
+  function describePdfError(err) {
+    const name = (err && err.name) || '';
+    if (name === 'PasswordException') {
+      return 'This PDF is password protected. Please provide an unlocked PDF.';
+    }
+    if (name === 'InvalidPDFException') {
+      return 'This PDF could not be read — the file looks damaged or incomplete.';
+    }
+    if (name === 'MissingPDFException') {
+      return 'The PDF could not be loaded.';
+    }
+    return 'Unable to render this PDF. The file may be damaged or use a feature this renderer does not support.';
+  }
+
+  /* Render one page and hand it to the workspace. Only ever the active page:
+   * rendering a whole document at tracing resolution is how a tab runs out of
+   * memory (brief J, K). */
+  async function renderPdfPage(pageNumber, opts) {
+    const o = opts || {};
+    if (!st.pdf || !st.pdf.doc) return;
+    const n = clamp(Math.round(Number(pageNumber) || 1), 1, st.pdf.pageCount);
+
+    // A render still running is working on a page nobody is waiting for.
+    safe(() => { if (st.pdf.renderTask) st.pdf.renderTask.cancel(); });
+    st.pdf.renderTask = null;
+
+    const busyBefore = st.busy;
+    st.busy = true; renderWidget();
+    if (st.pdf.pageCount > 1) toast(`Rendering page ${n} of ${st.pdf.pageCount}…`, 'info', 4000);
+
+    try {
+      const page = await st.pdf.doc.getPage(n);
+      const base = page.getViewport({ scale: 1 });
+      const plan = Imp.pdfRenderScale(base.width, base.height);
+      if (!plan.ok) throw new Error(plan.error);
+
+      const viewport = page.getViewport({ scale: plan.scale });
+      const canvas = document.createElement('canvas');
+      canvas.width = plan.width;
+      canvas.height = plan.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('This browser would not provide a canvas to render the page into.');
+
+      const task = page.render({ canvasContext: ctx, viewport });
+      st.pdf.renderTask = task;
+      try {
+        await task.promise;
+      } catch (err) {
+        // Cancelling is the expected outcome when the operator turns the page
+        // again before the previous render finished; it is not a failure.
+        if (err && err.name === 'RenderingCancelledException') return;
+        throw new Error('PDF page rendering failed. Please try another page or file.');
+      }
+      st.pdf.renderTask = null;
+      safe(() => page.cleanup());
+
+      st.pdf.pageNumber = n;
+      const label = st.pdf.pageCount > 1
+        ? `${st.pdf.fileName} — page ${n} of ${st.pdf.pageCount}`
+        : st.pdf.fileName;
+      mountRaster({ width: canvas.width, height: canvas.height, drawable: canvas },
+        label, 'pdf', { preserveSession: o.preserveSession === true });
+
+      toastOk(`${label} — ${canvas.width}×${canvas.height} px. Trace as usual; coordinates are image pixels until you georeference.`);
+      if (plan.capped) toast(plan.note, 'warn', 10000);
+    } catch (err) {
+      toastErr(String(err && err.message ? err.message : err));
+    } finally {
+      st.busy = busyBefore;
+      renderWidget();
+    }
+  }
+
+  /* Turning a page replaces the picture and keeps the parcels. The sheet
+   * underneath changes; what the operator drew on top of it is theirs. */
+  async function goToPdfPage(n) {
+    if (!st.pdf) return;
+    const target = clamp(Math.round(Number(n) || 1), 1, st.pdf.pageCount);
+    if (target === st.pdf.pageNumber) return;
+    await renderPdfPage(target, { preserveSession: true });
+  }
+
+  /* =====================================================================
+   * THE COMMON RASTER HAND-OFF
+   * ---------------------------------------------------------------------
+   * Every raster reaches the workspace through here, whatever produced it: a
+   * picked image file, a tab capture, an image already on the page, or a page
+   * rendered out of a PDF. By the time it arrives it is just
+   * { width, height, drawable } — the workspace neither knows nor needs to know
+   * which of those it was, which is what stops a second workspace, a second
+   * viewport or a second digitization path from ever being needed.
+   *
+   * `preserveSession` is the one difference between opening a sheet and turning
+   * a page. Opening a new sheet starts a new job, so the session is cleared;
+   * turning to page 2 of the same PDF replaces the picture underneath and must
+   * leave the operator's parcels exactly where they are.
+   * =================================================================== */
+  function mountRaster(image, name, kind, opts) {
+    const o = opts || {};
+    const made = Raster.createRasterWorkspace({
+      doc: document, win: window, Viewport,
+      image, sourceName: name, sourceKind: kind,
+    });
+    if (!made.ok) throw new Error(made.error);
+
+    // Park the live-map adapter rather than discarding it, so closing the
+    // workspace returns to exactly where the operator was.
+    if (!st.workspace) st.mapAdapter = st.adapter;
+    // The sheet being replaced no longer needs its blob URL, and an object URL
+    // pins the whole file in memory until it is revoked or the page goes away.
+    // Repeated imports would otherwise accumulate every sheet ever opened.
+    releaseWorkspaceUrl();
+    st.workspaceUrl = o.objectUrl || null;
+    if (st.workspace) st.workspace.destroy();
+    teardownSurface();
+    st.workspace = made.adapter;
+    st.adapter = made.adapter;
+    if (!o.preserveSession) {
+      clearSessionState();
+      st.crs = null; st.crsDetection = null;
+    }
+    ensureOverlay(); installGestures();
+    applyDrawingStyle();
+    autosave(); renderWidget(); draw();
+    return made.adapter;
   }
 
   /* Release the blob URL backing the open sheet, if this session minted one. */
@@ -2081,6 +2302,7 @@
     st.workspace.destroy();
     st.workspace = null;
     releaseWorkspaceUrl();
+    closePdfDocument();
     clearSessionState();
     teardownSurface();
     st.adapter = st.mapAdapter;
@@ -3276,6 +3498,25 @@ table.coord td:first-child{width:52px}
       <div class="list">${items}</div></div>`;
   }
 
+  /* The page selector for a multi-page PDF (brief §J). Rendered inside the
+   * existing drawing section rather than as a new panel, because it is a
+   * property of the open sheet like every other control there. */
+  function pdfPagesHtml() {
+    const p = st.pdf;
+    if (!p || p.pageCount <= 1) return '';
+    return `<div class="step" style="margin-top:6px">
+      <b>PDF page ${p.pageNumber} of ${p.pageCount}</b>
+      <div class="dim" style="font-size:10.5px;margin-top:2px">${esc(p.fileName)} — only the page you are on is rendered. Turning a page replaces the sheet underneath and keeps everything you have digitised.</div>
+      <div class="bnd15-row" style="margin-top:5px">
+        <button class="bnd15-btn sm gray" id="pdfPrev" ${p.pageNumber <= 1 ? 'disabled' : ''}>‹ Previous</button>
+        <button class="bnd15-btn sm gray" id="pdfNext" ${p.pageNumber >= p.pageCount ? 'disabled' : ''}>Next ›</button>
+      </div>
+      <div class="field"><span>Go to page</span>
+        <input type="number" id="pdfGoto" min="1" max="${p.pageCount}" value="${p.pageNumber}" style="width:64px">
+        <button class="bnd15-btn sm green" id="pdfGo">Go</button></div>
+    </div>`;
+  }
+
   /* RF and scale-bar calibration (brief §12, §13), plus the drawing-underlay
    * controls of §11. Kept together because they are all properties of the
    * sheet, and rigorously apart from anything to do with screen zoom. */
@@ -3367,6 +3608,7 @@ table.coord td:first-child{width:52px}
         <button class="bnd15-btn sm ${st.mode === 'georef' ? 'violet on' : 'violet'}" id="mGeoref">🌐 Georeference</button>
         <button class="bnd15-btn sm red" id="wsClose">✕ Close</button>
       </div>
+      ${pdfPagesHtml()}
       ${calibrationHtml()}
       <div class="field" style="margin-top:6px"><span title="How strongly the underlay is drawn. Lowering it makes traced boundaries easier to see against a dark scan.">Opacity</span>
         <input type="range" id="wsOpacity" min="10" max="100" value="${Math.round((S.drawingOpacity == null ? 1 : S.drawingOpacity) * 100)}"><span class="mono">${Math.round((S.drawingOpacity == null ? 1 : S.drawingOpacity) * 100)}%</span></div>
@@ -3430,7 +3672,7 @@ table.coord td:first-child{width:52px}
         ${item('iGeo', 'GeoJSON', 'Also written by this tool, so a session round-trips')}
         ${item('gcpImport', 'GCP / control points', 'QGIS .points, or any CSV once you confirm its columns')}
         ${item('iImage', 'Image (scanned sheet)', 'Digitize over a scanned cadastral drawing')}
-        ${item('iPdf', 'PDF page (capture)', "Chrome will not let extensions read PDF pixels, so the rendered page is captured")}
+        ${item('iPdf', 'PDF', 'Pick a PDF file; its pages are rendered by the extension itself, offline')}
       </div>
       <div class="bnd15-menu ${open === 'export' ? 'open' : ''}" id="menuExport">
         <div class="mh">Export</div>
@@ -4266,7 +4508,13 @@ table.coord td:first-child{width:52px}
     on('iCsv', 'onclick', () => importGeometryFile('csv'));
     on('iGeo', 'onclick', () => importGeometryFile('geojson'));
     on('iImage', 'onclick', () => { st.openMenu = null; openWorkspace('file'); });
-    on('iPdf', 'onclick', () => { st.openMenu = null; openWorkspace('capture'); });
+    on('iPdf', 'onclick', importPdfFile);
+    on('pdfPrev', 'onclick', () => goToPdfPage((st.pdf ? st.pdf.pageNumber : 1) - 1));
+    on('pdfNext', 'onclick', () => goToPdfPage((st.pdf ? st.pdf.pageNumber : 1) + 1));
+    on('pdfGo', 'onclick', () => {
+      const el = q('pdfGoto');
+      if (el) goToPdfPage(el.value);
+    });
     on('gcpLoad', 'onclick', () => importFile('gcps'));
 
     /* ---- CSV format dialog (brief §6, §17) -------------------------- */

@@ -27,6 +27,24 @@
   // page -> background -> page: tab capture, for PDFs and unreadable canvases.
   // The page world cannot call chrome.tabs itself, so the request is relayed
   // here and the resulting data URL handed back as a DOM event.
+  // page -> background -> page: load the PDF renderer into this tab on demand.
+  // Same relay shape as the capture request below; the page world cannot call
+  // chrome.scripting itself.
+  window.addEventListener('BND15_PDFJS_REQ', (e) => {
+    const token = (e && e.detail && e.detail.token) || '';
+    chrome.runtime.sendMessage({ type: 'BND15_LOAD_PDFJS' })
+      .then((res) => {
+        window.dispatchEvent(new CustomEvent('BND15_PDFJS_RES', {
+          detail: Object.assign({ token }, res || { ok: false, error: 'No response from the extension worker.' }),
+        }));
+      })
+      .catch((err) => {
+        window.dispatchEvent(new CustomEvent('BND15_PDFJS_RES', {
+          detail: { token, ok: false, error: (err && err.message) || 'Could not load the PDF renderer.' },
+        }));
+      });
+  });
+
   window.addEventListener('BND15_CAPTURE_REQ', (e) => {
     const token = (e && e.detail && e.detail.token) || '';
     chrome.runtime.sendMessage({ type: 'BND15_CAPTURE_TAB' })

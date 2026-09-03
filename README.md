@@ -9,16 +9,16 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
 **Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store. Submission answers — single purpose, permission justifications, data-usage declarations and a privacy policy — are drafted in [docs/chrome-web-store.md](docs/chrome-web-store.md).
-**Tests:** `npm test` — 575 tests. No install needed: 495 run immediately, and 79 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 583 tests. No install needed: 502 run immediately, and 81 that need a browser skip cleanly. To enable those:
 
 ```bash
 npm install --no-save jsdom            # 65 DOM integration tests
-npm install --no-save playwright-core  # 14 real-Chrome E2E tests (needs a Chrome binary)
+npm install --no-save playwright-core  # 16 real-Chrome E2E tests (needs a Chrome binary)
 ```
 
 **CI:** `.github/workflows/test.yml` runs the suite twice on every push and pull request. Once against a **bare checkout with nothing installed**, because "most of it runs the moment you unzip it" is a promise the project makes and a change could quietly break while every other check stayed green; and once with both optional dependencies plus **Playwright's own Chromium**, where **no test may skip** — a silently skipped end-to-end run must not be mistakable for a passing one.
 
-Deliberately not the runner's preinstalled Google Chrome: from **Chrome 137 the stable channel refuses `--load-extension` in headless mode**, so it loads no extension at all — `chrome://extensions` lists zero items, no service worker ever registers, and all fourteen end-to-end tests sit on their timeouts. Measured on Chrome 152; `--headless=new` and `--disable-features=DisableLoadExtensionCommandLineSwitch` were both tried and neither helps. Playwright's build has no such restriction and is the same engine, so nothing is given up.
+Deliberately not the runner's preinstalled Google Chrome: from **Chrome 137 the stable channel refuses `--load-extension` in headless mode**, so it loads no extension at all — `chrome://extensions` lists zero items, no service worker ever registers, and all sixteen end-to-end tests sit on their timeouts. Measured on Chrome 152; `--headless=new` and `--disable-features=DisableLoadExtensionCommandLineSwitch` were both tried and neither helps. Playwright's build has no such restriction and is the same engine, so nothing is given up.
 
 ---
 
@@ -112,15 +112,25 @@ Much cadastral material is not a web map at all: it is a scanned sheet, a photog
 
 That is the payoff of having an adapter layer. A static raster is presented through exactly the interface a live map exposes, so nothing downstream needed changing; supporting an entirely new kind of source was one new adapter, not a special case threaded through the application.
 
-Three ways in:
+Four ways in:
 
 | Source | Use it for |
 |---|---|
-| **📂 Open file** | A scanned sheet or photograph from disk. Full source resolution. |
-| **📸 Capture view** | **PDFs**, and any map canvas too cross-origin-protected to read. |
+| **📂 Image (scanned sheet)** | A scanned sheet or photograph from disk. Full source resolution. |
+| **📄 PDF** | A cadastral sheet as a PDF file. Rendered by the extension itself. |
+| **📸 Capture view** | Any map canvas too cross-origin-protected to read, and PDFs already open in Chrome's own viewer. |
 | **🖼 Page image** | An image already displayed on the page. |
 
-**Why PDFs go through capture.** Chrome renders PDFs in an internal PDFium viewer whose pixels extensions cannot read — there is no canvas to sample and no DOM to inspect. Bundling a PDF renderer would mean shipping about a megabyte of third-party code that could not be tested here. Capturing the rendered tab sidesteps both problems, since the browser has already done the rasterising. The honest limitation is that a capture is **screen** resolution, not source resolution: zoom the PDF up first, and take a large sheet in sections.
+**How PDFs are read.** You pick the PDF *file*, and the extension rasterises it itself with a vendored copy of [PDF.js](https://mozilla.github.io/pdf.js/) — the same renderer Firefox ships. The page comes out at **2400 px on its long edge**, roughly 200 dpi for an A4 sheet, which is where plot numbers stay legible. From that point on it is an ordinary raster: it goes through the same hand-off a picked image uses, and the workspace never learns a PDF was involved.
+
+- **Nothing is fetched.** PDF.js lives in `vendor/` and is injected into the page by the service worker straight from the extension package. No CDN, no `web_accessible_resources`, no network of any kind — the whole path works offline.
+- **No new permissions.** The tab is already accessible because `activeTab` was granted when you opened the digitizer on it. Injecting the renderer uses the `scripting` permission the extension already has.
+- **It runs on the main thread**, on purpose. Loading the worker bundle into the same context is PDF.js's documented way of doing this. A real `Worker` would be created from a `chrome-extension:` URL inside the *page's* world, where the portal's own Content-Security-Policy applies and a `worker-src` directive would block it. Rendering one sheet on the main thread is a smaller cost than an import that fails on whichever portals set that header. `isEvalSupported: false` keeps it off `eval` for the same reason.
+- **Multi-page PDFs** get a page selector. Only the page you are on is rendered — rasterising a whole document at tracing resolution is how a tab runs out of memory. Turning a page replaces the sheet underneath and **keeps everything you have digitised**.
+- **Very large pages are capped** at 40 megapixels and 12000 px per side, and you are told when that happened rather than being quietly handed a lower-resolution sheet.
+- The bytes decide whether a file is a PDF, not its name: extensions and MIME types are both routinely wrong on files that arrive by email or a messaging app.
+
+**Capture view is still there**, for two cases the renderer cannot serve: a map canvas too cross-origin-protected to read, and a PDF already open in Chrome's own viewer — PDFium's pixels are unreachable to an extension, so a capture is the only way in. The honest limitation of a capture is that it is **screen** resolution, not source resolution: zoom up first, and take a large sheet in sections. If you have the file, use **📄 PDF** instead.
 
 Tracing on a raster always samples the image at its **native** resolution regardless of display zoom, so unlike a live map there is no need to zoom in for precision — it is already there. The workspace tells you when you are zoomed out far enough that clicks are no longer pixel-accurate.
 
@@ -382,14 +392,16 @@ lib/site_adapters.js   map-library adapters + portal registry
 lib/history.js         snapshot undo/redo over the whole session
 lib/importers.js       DXF, KML/KMZ, GeoJSON and CSV readers
 lib/geom_edit.js       move/rotate/scale, the shift record, RF + scale-bar calibration
-test/                  575 tests — npm test
+vendor/                PDF.js, vendored verbatim (Apache-2.0) — the only third-party
+                       code shipped; injected on demand, never fetched
+test/                  583 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```
 
 ### Packaging for the Chrome Web Store
 
-`npm run package` writes `dist/cadastral-digitizer-<version>.zip` — 21 files, about 550 KB, with `manifest.json` at the root as the store requires.
+`npm run package` writes `dist/cadastral-digitizer-<version>.zip` — 23 files, about 1.9 MB, with `manifest.json` at the root as the store requires. Most of that is the vendored PDF.js; the extension's own code is under 600 KB.
 
 **The file list is derived, never written down.** It is read from the extension's own declarations: the manifest's service worker, popup and icons; `background.js`'s `MAIN_WORLD_FILES`; the popup's own `<script src>`. A hand-maintained list is exactly what goes stale — add a library to `lib/`, forget to add it here, and Chrome accepts an upload that installs cleanly and then dies on first use, in the store, where fixing it costs a review cycle. There is a test that injects precisely that mistake and confirms the suite catches it.
 
@@ -421,13 +433,13 @@ Everything in `lib/` is pure — no DOM, no map object — so the code the exten
 
 **A note on settings.** Two settings were found carrying their weight in name only. `showValidityWarnings` had no control and nothing read it — it promised control over behaviour that did not exist, so it is gone; flagging a self-intersecting ring is a correctness signal and not the sort of thing a checkbox should be able to silence. `bboxLeakWarnPct` was likewise dead, but the check it named turned out to be worth building, so it now does what it always claimed. A test asserts that every setting is both read by the code and reachable from the panel, or else appears on a short list of deliberate internals — so a setting cannot quietly become decoration again.
 
-**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 575 every time.
+**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 583 every time.
 
 ---
 
 ## What is verified, and what is not
 
-**Verified by test (575, run with `npm test`):**
+**Verified by test (583, run with `npm test`):**
 
 - **The extension installed in real Chrome.** `test/chrome_e2e.test.js` loads the actual unpacked extension into headless Chrome via Playwright and exercises the parts no simulation can reach:
   - `chrome.scripting.executeScript` with `world: 'MAIN'` really injecting the libraries into the page's own JS world, in the right order — checked by having the *page* look for them.
@@ -435,7 +447,9 @@ Everything in `lib/` is pure — no DOM, no map object — so the code the exten
   - Batch vectorisation finding all four and rejecting the background.
   - Click leakage measured from the outside, by a fixture that counts its own clicks: zero reach it while a tool is armed, and exactly one does when idle.
   - `chrome.tabs.captureVisibleTab` returning a real PNG through the content-script bridge.
-  - **A real PDF**, rendered by Chrome's own PDFium viewer, captured, decoded, mounted as a workspace, and its rectangle confirmed present in the pixels.
+  - **A real PDF file, picked through the extension's own Import menu.** A real file chooser is answered with a PDF on disk, the service worker injects PDF.js into the page world, the page is rasterised at 2400×1800 and mounted in the raster workspace — and the sheet's rectangle is confirmed present in the workspace's pixels. Being able to *select* a file proves nothing, so that last check is the one that counts.
+  - **Turning a page of a multi-page PDF**: a parcel is drawn on page 1, the page is turned, page 2's rectangle is confirmed on screen, page 1's confirmed gone — and the drawn parcel is still there, which is what `preserveSession` exists for.
+  - **A real PDF in Chrome's own PDFium viewer**, captured, decoded, mounted as a workspace, and its rectangle confirmed present in the pixels — the fallback path, for a PDF that is already open rather than to hand as a file.
   - The badge count crossing three contexts: page world → isolated content script → service worker.
   - A real download, parsed back as GeoJSON with coordinates checked to fall in Jharkhand.
   - **The permission model, negatively.** Loaded exactly as shipped, with no `host_permissions`, injection is refused *and* Chrome withholds every tab URL from the extension. Nothing happens until the user invokes it.
@@ -459,7 +473,7 @@ Everything in `lib/` is pure — no DOM, no map object — so the code the exten
 - **The `activeTab` grant itself.** Chrome grants it only when you click the toolbar button, and headless Chrome cannot click browser chrome. What *is* verified is that the extension genuinely depends on it: loaded as shipped, injection is refused and tab URLs are withheld. So the mechanism is proven; producing the grant is the one manual step.
 - **The Google Maps adapter**, which needs a live Google Maps page and depends on an `OverlayView` projection only Google supplies. Treat it as best-effort: if tagging does nothing there, pan once and retry. OpenLayers (every BhuNaksha deployment), Leaflet and MapLibre are the tested paths.
 
-Everything previously on this list — the gesture layer, click blocking, the control-point workflow, exports, persistence, MAIN-world injection, real canvas rasterisation, tab capture and the PDF path — is now executed by tests rather than asserted in prose.
+Everything previously on this list — the gesture layer, click blocking, the control-point workflow, exports, persistence, MAIN-world injection, real canvas rasterisation, tab capture and both PDF paths — is now executed by tests rather than asserted in prose.
 
 - The DOM-level gesture layer. Tap-versus-drag, handle hit-testing and overlay alignment are code-reviewed but not executed, since testing them properly needs a browser harness larger than the code itself.
 - `chrome.scripting` MAIN-world injection on a live page.

@@ -42,6 +42,25 @@ const MAIN_WORLD_FILES = [
   'page_inject.js',
 ];
 
+/* PDF.js, injected only when a PDF is actually imported.
+ *
+ * Kept out of MAIN_WORLD_FILES deliberately: it is 1.4 MB, and paying that on
+ * every activation to serve the minority of sessions that open a PDF would slow
+ * down the common case for no reason. Injected on demand instead, once per tab.
+ *
+ * Both files, in this order. Loading pdf.worker.min.js into the same context is
+ * PDF.js's documented way of running without a separate worker thread, which is
+ * what this needs: a real Worker would be created from a chrome-extension URL
+ * inside the PAGE's world, where the portal's own Content-Security-Policy
+ * applies and a `worker-src` directive would block it. Rendering one cadastral
+ * sheet on the main thread is a smaller cost than an import that fails on
+ * whichever portals happen to set that header.
+ */
+const PDFJS_FILES = [
+  'vendor/pdf.min.js',
+  'vendor/pdf.worker.min.js',
+];
+
 async function activate(tabId, action) {
   // The bridge first, so it is listening before the page script starts talking.
   await chrome.scripting.executeScript({
@@ -118,6 +137,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         error: (e && e.message) ||
           'Capture failed. Chrome refuses to capture its own pages (chrome://, the Web Store). ' +
           'Reopen the extension from the toolbar button on this tab and try again.',
+      }));
+    return true; // async response
+  }
+
+  /* ---------------------------------------------------------------------
+   * Load the PDF renderer into the page world, on demand.
+   *
+   * Injected through chrome.scripting rather than fetched by the page, so the
+   * files are read straight from the extension package: no CDN, no
+   * web_accessible_resources, no network of any kind, and it works offline.
+   * The tab is already accessible because activeTab was granted when the
+   * operator opened the digitizer on it, so this needs no new permission.
+   * ------------------------------------------------------------------- */
+  if (message.type === 'BND15_LOAD_PDFJS') {
+    const tabId = sender && sender.tab && sender.tab.id;
+    if (!tabId) { sendResponse({ ok: false, error: 'No tab to load the PDF renderer into.' }); return true; }
+    chrome.scripting.executeScript({ target: { tabId }, files: PDFJS_FILES, world: 'MAIN' })
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({
+        ok: false,
+        error: (e && e.message)
+          || 'The PDF renderer could not be loaded into this page. Reopen the digitizer from the toolbar button and try again.',
       }));
     return true; // async response
   }

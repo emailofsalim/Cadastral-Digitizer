@@ -52,6 +52,14 @@ an exportable file, which is why they belong to one purpose rather than several.
 > `scripting` is used to inject the extension's own bundled files, in the page
 > world, when the user activates it on a tab. All injected code ships inside the
 > extension package; nothing is fetched or evaluated from a remote source.
+>
+> One further injection happens on demand: when the user opens a PDF, the
+> bundled PDF rendering library (Mozilla's PDF.js, in `vendor/`) is injected into
+> the same tab so the file can be rasterised locally. It is 1.4 MB and is of no
+> use to sessions that never open a PDF, which is the only reason it is injected
+> on demand rather than at activation. It is read from the extension package like
+> every other injected file, and needs no permission beyond the `activeTab` grant
+> the user has already given that tab.
 
 ### Why there are no host permissions
 
@@ -69,14 +77,38 @@ is the strongest thing about this extension's privacy posture:
 **Answer: No, I am not using remote code.**
 
 > All executable code ships inside the extension package. There are no remote
-> scripts, no CDN references, no `eval()`, no `new Function()`, and no
-> `importScripts()` of anything outside the package. The libraries the extension
-> injects are its own files, listed in the manifest's package.
+> scripts, no CDN references, and nothing is loaded or evaluated from outside the
+> package at any point. The extension bundles one third-party library — Mozilla's
+> PDF.js, under Apache-2.0, used to render PDF pages locally — which is included
+> verbatim in the package and never fetched.
 
-Verified against the shipped files: no `eval`, no `new Function`, no remote
-`<script src>`, and no `fetch`, `XMLHttpRequest`, `sendBeacon` or `WebSocket`
-anywhere in `background.js`, `content.js`, `page_inject.js`, `popup.js` or
-`lib/*.js`.
+Verified against the extension's **own** files: no `eval`, no `new Function`, no
+remote `<script src>`, and no `fetch`, `XMLHttpRequest`, `sendBeacon` or
+`WebSocket` anywhere in `background.js`, `content.js`, `page_inject.js`,
+`popup.js` or `lib/*.js`.
+
+**PDF.js is a general-purpose library and does contain such constructs**, in code
+paths this extension does not take. Stated plainly rather than glossed, because a
+reviewer running a string search will find them:
+
+| Found in `vendor/*.js` | Why it does not run here |
+|---|---|
+| `eval("require")(…)` | A Node.js-only branch, guarded by PDF.js's `isNodeJS` check. It cannot be reached in a browser. |
+| `new Function` | PDF.js's compiler for PostScript functions embedded in a PDF. The extension passes `isEvalSupported: false`, which is exactly the option that turns it off; PDF.js then interprets those functions instead. |
+| `importScripts` | Part of PDF.js's Web Worker bootstrap. The extension runs it on the main thread instead — see below — so no worker is ever created and that path is never entered. |
+| `fetch` / `XMLHttpRequest` | PDF.js's transports for fetching a PDF **by URL**, and for character maps and standard font data. The extension hands it the file's bytes directly and configures no `cMapUrl` or `standardFontDataUrl`, so no transport is constructed and no URL exists to request. |
+
+That last row is asserted by a test, not just described: the end-to-end suite
+imports a real PDF in real Chrome with a request listener attached, and requires
+the count of network requests made during the import to be **zero**.
+
+**Why the renderer runs on the main thread.** PDF.js normally rasterises in a Web
+Worker. A worker would have to be created from a `chrome-extension:` URL inside
+the *page's* world, where the visited site's own Content-Security-Policy applies
+— a site with a `worker-src` directive would block it, and PDF import would fail
+on that site with nothing the user could do about it. Loading the worker bundle
+into the same context is PDF.js's own documented way of running without a worker
+thread, and it is what the extension does.
 
 ---
 
@@ -189,8 +221,13 @@ or a gist is fine — and paste the link into the dashboard.
    The justification above answers it directly: the page's map object is only
    reachable from the page's own JavaScript world. Being specific about *why*
    is what makes this read as a technical necessity rather than over-reach.
-2. **Screen capture for PDFs.** `chrome.tabs.captureVisibleTab` is covered by
-   `activeTab` and needs no separate permission, but if asked: Chrome renders
-   PDFs in an internal viewer whose pixels an extension cannot read, so
-   digitizing a PDF page requires capturing the rendered tab. The capture is
-   drawn to a canvas in the page and never leaves the device.
+2. **Screen capture.** `chrome.tabs.captureVisibleTab` is covered by `activeTab`
+   and needs no separate permission, but if asked: it exists for a map canvas
+   the page protects from being read, and for a PDF already open in Chrome's
+   internal viewer, whose pixels an extension cannot read. The capture is drawn
+   to a canvas in the page and never leaves the device.
+3. **A 1.4 MB minified third-party file.** `vendor/pdf.min.js` and
+   `vendor/pdf.worker.min.js` are Mozilla's PDF.js, unmodified, with the upstream
+   licence in `vendor/LICENSE-pdfjs` and the exact version and source recorded in
+   `vendor/README.md`. The Remote code section above covers what a string search
+   through them will turn up.
