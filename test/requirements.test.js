@@ -1200,3 +1200,23 @@ test('R18-7c: a control behind a collapsed section is reachable by opening it', 
   assert.match(e2e, /#btnExport/,
     'and open the Export menu before clicking an export');
 });
+
+test('R16g: the end-to-end suite drives the extension over http, never file://', () => {
+  // An extension's host permissions, <all_urls> included, do not grant access
+  // to file:// pages — Chrome gates that behind a separate per-extension
+  // setting no manifest or command-line flag can supply. Playwright's bundled
+  // Chromium is permissive about it and real Chrome is not, so a file:// URL
+  // here passes locally and stalls every test on a CI runner until the job is
+  // killed. It is also simply not a surface the extension supports:
+  const bg = read('background.js');
+  assert.match(bg, /\^https\?:\\\/\\\//,
+    'isInjectable must accept http(s) only, which is why file:// cannot be a fixture');
+
+  const e2e = read('test/chrome_e2e.test.js');
+  const code = e2e.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(!/['"`]file:\/\//.test(code),
+    'no fixture may be opened as a file:// URL; serve it over http://127.0.0.1 instead');
+  assert.match(code, /http\.createServer/, 'the fixtures must be served');
+  assert.match(code, /fixtureServer\.unref\(\)/,
+    'and the listening socket must not be able to hold the runner open');
+});

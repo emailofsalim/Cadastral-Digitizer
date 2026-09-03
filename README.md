@@ -8,7 +8,7 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
-**Tests:** `npm test` — 551 tests. No install needed: 479 run immediately, and 72 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 552 tests. No install needed: 480 run immediately, and 72 that need a browser skip cleanly. To enable those:
 
 ```bash
 npm install --no-save jsdom            # 58 DOM integration tests
