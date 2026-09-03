@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Cadastral Digitizer — BhuNaksha & GIS",
-  "version": "17.0.0",
+  "version": "17.1.0",
   "description": "Digitize cadastral and GIS parcels on any portal, or from a scanned sheet, image or PDF page. Colour tracing, batch vectorisation, draggable ground control points with cross-validated georeferencing, topology clean-up, and DXF / KMZ / GeoJSON / Shapefile / WKT / CSV export. Developed by Md Salim Ansari. MIT licensed.",
   "author": "Md Salim Ansari",
   "homepage_url": "https://github.com/emailofsalim/bhunaksha-digitizer",

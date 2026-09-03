@@ -1,4 +1,4 @@
-# Cadastral Digitizer — v17.0
+# Cadastral Digitizer — v17.1
 
 **Developed by Md Salim Ansari** · MIT licence (see [LICENSE](LICENSE))
 

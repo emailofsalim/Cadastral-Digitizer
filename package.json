@@ -1,6 +1,6 @@
 {
   "name": "cadastral-digitizer",
-  "version": "17.0.0",
+  "version": "17.1.0",
   "private": true,
   "description": "Browser extension for digitizing cadastral and GIS parcels from map portals, scanned sheets, images and PDF pages. This package.json exists only to run the test suite; the extension itself ships as plain unbundled files with no runtime dependencies.",
   "author": "Md Salim Ansari",
