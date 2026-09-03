@@ -1173,3 +1173,30 @@ test('R18-x: the centroid and area are stable at real UTM magnitudes', () => {
   assert.ok(Math.abs(rotated - area0) < 1e-6,
     `area changed by ${Math.abs(rotated - area0)} m² under a pure rotation`);
 });
+
+test('R18-7b: every default-open section names a section that exists', () => {
+  // 'io' was in this list from an earlier design in which Import/Export was a
+  // collapsible section rather than two of the three permanent buttons. It
+  // named nothing, so it silently did nothing — the same class of decorative
+  // setting the suite already guards against elsewhere.
+  const block = PAGE.match(/const DEFAULT_SETTINGS = \{([\s\S]*?)\n  \};/)[1];
+  const defaults = (block.match(/openSections:\s*\[([^\]]*)\]/) || [])[1] || '';
+  const wanted = [...defaults.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+  assert.ok(wanted.length, 'some section should start open');
+  const declared = new Set([...PAGE.matchAll(/section\('([^']+)'/g)].map((m) => m[1]));
+  for (const key of wanted) {
+    assert.ok(declared.has(key),
+      `openSections names "${key}", but no section('${key}', ...) exists — it would open nothing`);
+  }
+});
+
+test('R18-7c: a control behind a collapsed section is reachable by opening it', () => {
+  // jsdom has no layout, so it will click a hidden button and report success.
+  // Real Chrome will not. The E2E suite is what enforces this, and it must
+  // drive the UI the way an operator does rather than reaching past it.
+  const e2e = read('test/chrome_e2e.test.js');
+  assert.match(e2e, /details\.sect\[data-sect="cleanup"\] > summary/,
+    'the E2E suite must expand a section before using the controls inside it');
+  assert.match(e2e, /#btnExport/,
+    'and open the Export menu before clicking an export');
+});

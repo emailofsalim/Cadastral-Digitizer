@@ -517,6 +517,12 @@ t('an export produces a real download in Chrome', async () => {
     () => /Shape 1/.test(document.querySelector('#bnd15-widget').textContent),
     null, { timeout: 15000 });
 
+  // Export lives behind the Export ▾ menu since 17.0, so a real browser has to
+  // open it first — this is the one suite that enforces genuine visibility,
+  // because jsdom has no layout and will happily click a hidden button.
+  await page.click('#bnd15-widget #btnExport');
+  await page.waitForSelector('#bnd15-widget #menuExport.open', { timeout: 5000 });
+
   const [download] = await Promise.all([
     page.waitForEvent('download', { timeout: 15000 }),
     page.click('#bnd15-widget #xGeo'),
@@ -657,7 +663,11 @@ t('a full session raises no page or worker errors', async () => {
   const text = await page.textContent('#bnd15-widget');
   assert.match(text, /1 active/, `a control point should exist: ${text.slice(0, 300)}`);
 
-  // Clean-up and report.
+  // Clean-up and report. The section collapses since 17.0, so it is expanded
+  // the way an operator would — by its summary — rather than by reaching past
+  // the UI to the buttons inside it.
+  await page.click('#bnd15-widget details.sect[data-sect="cleanup"] > summary');
+  await page.waitForSelector('#bnd15-widget details.sect[data-sect="cleanup"][open]', { timeout: 5000 });
   await page.click('#bnd15-widget #regAll');
   await page.waitForTimeout(500);
   await page.click('#bnd15-widget #qual');
