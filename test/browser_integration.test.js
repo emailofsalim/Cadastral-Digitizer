@@ -1594,3 +1594,95 @@ t('the CRS question names the family it can read, without inventing a zone', asy
   assert.match(PAGE, /adoptImportedRings\(held\.result, held\.opts\)/,
     'and answering must resume the same import');
 });
+
+/* =====================================================================
+ * IMAGE IMPORT — OBJECT URL LIFETIME
+ * ---------------------------------------------------------------------
+ * An object URL keeps the entire file alive until it is revoked. The file
+ * picker minted one per import and never released it, so opening four sheets
+ * in a session pinned four sheets in memory, and a failed import pinned a file
+ * that was never even displayed. Nothing surfaced it: the workspace looked
+ * fine, and the cost was invisible until the tab got slow.
+ *
+ * The URL now belongs to the open sheet — released when another replaces it,
+ * when the workspace closes, and when an import fails after minting one.
+ * =================================================================== */
+
+/* The picker cannot be driven headlessly without also making images "load":
+ * jsdom never fires onload for a blob: URL. Both are stubbed here rather than
+ * in boot(), so no other test's behaviour changes. */
+function stubImageLoading(win) {
+  Object.defineProperty(win.HTMLImageElement.prototype, 'naturalWidth', { get() { return 800; }, configurable: true });
+  Object.defineProperty(win.HTMLImageElement.prototype, 'naturalHeight', { get() { return 600; }, configurable: true });
+  const real = Object.getOwnPropertyDescriptor(win.HTMLImageElement.prototype, 'src');
+  Object.defineProperty(win.HTMLImageElement.prototype, 'src', {
+    configurable: true,
+    get() { return ''; },
+    set(v) {
+      if (real && real.set) real.set.call(this, v);
+      setTimeout(() => { if (this.onload) this.onload(); }, 0);
+    },
+  });
+}
+
+/* Count object URLs that have been minted and not revoked. */
+function trackObjectUrls(win) {
+  let n = 0;
+  const live = new Set();
+  win.URL.createObjectURL = () => { const u = `blob:tracked-${++n}`; live.add(u); return u; };
+  win.URL.revokeObjectURL = (u) => { live.delete(u); };
+  return { live, minted: () => n };
+}
+
+async function importAnImage(ctx, name) {
+  feedNextFilePicker(ctx.win, name || 'sheet.jpg', 'fake-image-bytes');
+  click(q(ctx.widget, '#btnImport'));
+  await settle(2);
+  click(q(ctx.widget, '#iImage'));
+  await settle(10);
+}
+
+t('repeated image imports do not accumulate object URLs', async () => {
+  const ctx = await boot();
+  stubImageLoading(ctx.win);
+  const urls = trackObjectUrls(ctx.win);
+
+  for (let i = 1; i <= 4; i++) {
+    await importAnImage(ctx, `sheet-${i}.jpg`);
+    assert.strictEqual(urls.live.size, 1,
+      `after ${i} import(s) exactly one sheet should be held, found ${urls.live.size}`);
+  }
+  assert.strictEqual(urls.minted(), 4, 'sanity: four imports should have minted four URLs');
+});
+
+t('closing the workspace releases the sheet it was holding', async () => {
+  const ctx = await boot();
+  stubImageLoading(ctx.win);
+  const urls = trackObjectUrls(ctx.win);
+
+  await importAnImage(ctx);
+  assert.strictEqual(urls.live.size, 1, 'setup: a sheet should be open');
+
+  click(q(ctx.widget, '#wsClose'));
+  await settle(6);
+  assert.strictEqual(urls.live.size, 0, 'closing must release the file, not merely hide it');
+});
+
+t('an import that fails does not leave the file pinned', async () => {
+  // The worst version of the leak: a file the operator never even saw, held
+  // for the lifetime of the page.
+  const ctx = await boot();
+  Object.defineProperty(ctx.win.HTMLImageElement.prototype, 'src', {
+    configurable: true,
+    get() { return ''; },
+    set() { setTimeout(() => { if (this.onerror) this.onerror(); }, 0); },
+  });
+  const urls = trackObjectUrls(ctx.win);
+
+  await importAnImage(ctx, 'corrupt.jpg');
+  assert.strictEqual(urls.minted(), 1, 'setup: the picker should have minted a URL');
+  assert.strictEqual(urls.live.size, 0, 'a failed import must release the URL it minted');
+  // And it must say so rather than failing silently.
+  assert.match(ctx.win.document.body.textContent, /could not decode|damaged|unsupported/i,
+    'the operator must be told the image could not be read');
+});

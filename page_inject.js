@@ -210,6 +210,9 @@
     // Raster workspace (image / PDF page). When active, coordinates are image
     // pixels until georeferencing says otherwise.
     workspace: null,             // the raster adapter, when one is open
+    // Blob URL backing the open sheet, when the file picker minted one. Held so
+    // it can be revoked; an unreleased object URL pins the whole file.
+    workspaceUrl: null,
     mapAdapter: null,            // the live-map adapter, kept for restoring
     georef: null,                // { fit, crs, rms, looRms, residuals } pixel -> CRS
     georefPoints: [],            // [{ id, pixel:[x,y], world:[x,y], enabled }]
@@ -1992,12 +1995,17 @@
       `You have ${st.shapes.length} shape(s) digitised against the current map. Export or save them first if you need them — continue?`)) return;
 
     let url = null, name = 'image', kind = source;
+    // Only a URL WE minted needs revoking. A capture is a data: URL and a page
+    // image belongs to the page; calling revoke on either would be meaningless
+    // at best and wrong in intent.
+    let mintedUrl = null;
     try {
       st.busy = true; renderWidget();
       if (source === 'file') {
         const f = await pickFile('image/*');
         if (!f) { st.busy = false; renderWidget(); return; }
         url = URL.createObjectURL(f);
+        mintedUrl = url;
         name = f.name;
       } else if (source === 'capture') {
         /* CAPTURE VIEW (brief §22). The digitizer hides itself so the capture
@@ -2031,6 +2039,13 @@
       // Park the live-map adapter rather than discarding it, so closing the
       // workspace returns to exactly where the operator was.
       if (!st.workspace) st.mapAdapter = st.adapter;
+      // The sheet being replaced no longer needs its blob URL, and an object
+      // URL pins the whole file in memory until it is revoked or the page goes
+      // away. Repeated imports would otherwise accumulate every sheet ever
+      // opened.
+      releaseWorkspaceUrl();
+      st.workspaceUrl = mintedUrl;
+      mintedUrl = null;              // ownership transferred; the catch must not revoke it
       teardownSurface();
       st.workspace = made.adapter;
       st.adapter = made.adapter;
@@ -2046,9 +2061,18 @@
     } catch (err) {
       toastErr(String(err && err.message ? err.message : err));
     } finally {
+      // An import that failed after minting a URL still has one to release.
+      if (mintedUrl) { safe(() => URL.revokeObjectURL(mintedUrl)); mintedUrl = null; }
       st.busy = false;
       renderWidget();
     }
+  }
+
+  /* Release the blob URL backing the open sheet, if this session minted one. */
+  function releaseWorkspaceUrl() {
+    if (!st.workspaceUrl) return;
+    safe(() => URL.revokeObjectURL(st.workspaceUrl));
+    st.workspaceUrl = null;
   }
 
   function closeWorkspace() {
@@ -2056,6 +2080,7 @@
     if (st.shapes.length && !confirm(`Close the image workspace and discard ${st.shapes.length} shape(s) digitised on it?`)) return;
     st.workspace.destroy();
     st.workspace = null;
+    releaseWorkspaceUrl();
     clearSessionState();
     teardownSurface();
     st.adapter = st.mapAdapter;

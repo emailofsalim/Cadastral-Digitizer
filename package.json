@@ -14,9 +14,9 @@
   },
   "//": [
     "Both dev dependencies are OPTIONAL. With neither installed, `npm test` still",
-    "runs 496 tests and the 76 that need a browser skip cleanly \u2014 which is what",
+    "runs 495 tests and the 79 that need a browser skip cleanly \u2014 which is what",
     "makes the suite useful to someone who has just unzipped the extension.",
-    "  npm install --no-save jsdom            enables 62 DOM integration tests",
+    "  npm install --no-save jsdom            enables 65 DOM integration tests",
     "  npm install --no-save playwright-core  enables 14 real-Chrome E2E tests",
     "playwright-core also needs a Chrome binary on the machine; the E2E file looks",
     "for the usual locations and skips if it finds none.",
