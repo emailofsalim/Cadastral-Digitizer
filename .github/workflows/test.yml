@@ -1,0 +1,108 @@
+# =============================================================================
+# Test suite.
+#
+# Two jobs, because this project makes two separate promises about its tests and
+# only one of them is checked by running the suite the usual way.
+#
+#   1. `zero-install` runs `npm test` against a bare checkout, with nothing
+#      installed at all. That is the property the README claims and the one that
+#      makes the suite useful to someone who has just unzipped the extension:
+#      most tests run immediately, and the ones needing a browser skip cleanly
+#      rather than failing. A change that quietly makes jsdom mandatory would
+#      pass every other check and break exactly that promise, so it gets a job.
+#
+#   2. `full` installs both optional dev dependencies and runs everything,
+#      including the real-Chrome end-to-end tests against the runner's
+#      preinstalled Google Chrome. These are the tests that catch what a
+#      simulated DOM cannot — most recently that jsdom will happily click a
+#      button inside a collapsed section while a real browser refuses, because
+#      jsdom has no layout.
+#
+# The extension itself has no runtime dependencies and ships unbundled, so there
+# is nothing to build and no lockfile to cache.
+# =============================================================================
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zero-install:
+    name: No install (the unzip-and-run promise)
+    runs-on: ubuntu-latest
+    # The suite takes well under a minute; anything approaching this is a hang,
+    # and a hang must fail visibly rather than sit on a runner for six hours.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 22. The `npm test` script passes a quoted glob to `node --test`,
+      # which the test runner expands itself — that needs Node 21 or newer, so
+      # this is a floor rather than a preference.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      - name: Confirm nothing is installed
+        run: |
+          test ! -d node_modules || { echo "node_modules must not be present for this job"; exit 1; }
+
+      - name: Run the suite with no dependencies at all
+        run: npm test
+
+  full:
+    name: Full suite (jsdom + real Chrome)
+    runs-on: ubuntu-latest
+    # Locally the whole suite, Chrome included, is about 30 seconds. The first
+    # CI run of this job sat at seven minutes with no output, so it is bounded:
+    # a test runner that does not exit has to be a failure with logs, not an
+    # occupied runner.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      # Both are optional and deliberately not saved: the extension has no
+      # dependencies, and package.json says so.
+      - name: Install the optional test dependencies
+        run: npm install --no-save jsdom playwright-core
+
+      # The E2E suite looks for a browser in a few known locations and skips if
+      # it finds none. Failing loudly here instead means a silently skipped E2E
+      # run cannot be mistaken for a passing one.
+      - name: Confirm a Chrome binary is available
+        run: |
+          for p in /usr/local/bin/chrome /usr/bin/google-chrome /usr/bin/chromium; do
+            if [ -x "$p" ]; then echo "found $p"; exit 0; fi
+          done
+          echo "No Chrome binary found; the end-to-end tests would skip silently."
+          exit 1
+
+      # A skip is legitimate on a developer's machine and not here, where both
+      # dependencies and a browser are known to be present — so the skip count
+      # is checked from this same run rather than by running the suite twice.
+      # `pipefail` keeps a failing suite failing through the pipe.
+      - name: Run everything, and require that nothing skipped
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee /tmp/tap.txt
+          skipped=$(grep -E '^# skipped' /tmp/tap.txt | tail -1 | awk '{print $3}')
+          echo "skipped: ${skipped:-unknown}"
+          if [ "${skipped:-1}" != "0" ]; then
+            echo "Expected every test to run here, but ${skipped:-an unknown number} skipped."
+            exit 1
+          fi

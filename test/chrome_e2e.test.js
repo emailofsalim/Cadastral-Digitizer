@@ -101,9 +101,11 @@ function launch() {
  * permission test deliberately runs a second, differently-configured browser.
  * Missing one leaves an orphaned Chrome holding a temp profile.
  *
- * The runner needs --test-force-exit for this file: Playwright keeps handles
- * open that stop Node's loop draining, so the process would otherwise sit
- * forever after the last test passes. `after` therefore has to be prompt.
+ * Nothing here may outlive the last test. --test-force-exit was removed in
+ * 16.3.0 because it truncated the TAP output, so the runner now waits for the
+ * event loop to drain: a browser context or a listening socket left open does
+ * not slow the suite down, it hangs it forever. `after` therefore has to close
+ * everything, and the fixture server is unref'd as a second line of defence.
  */
 const allContexts = [];
 
@@ -111,10 +113,61 @@ after(async () => {
   await Promise.all(allContexts.map(async (c) => {
     try { await c.close(); } catch (e) { /* already gone */ }
   }));
+  if (fixtureServer) {
+    await new Promise((resolve) => fixtureServer.close(resolve));
+    fixtureServer = null;
+    fixtureOrigin = null;
+  }
   if (tmpRoot) { try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (e) { /* ignore */ } }
 });
 
-const FIXTURE = 'file://' + path.join(ROOT, 'test', 'fixtures', 'stub-map.html');
+/* ---------------------------------------------------------------------
+ * The fixtures are served over HTTP, not opened as file:// URLs.
+ *
+ * This is not a detail. An extension's host permissions — even <all_urls> —
+ * do NOT grant access to file:// pages; Chrome gates that behind a separate
+ * per-extension "Allow access to file URLs" setting that cannot be set from a
+ * manifest or a command-line flag. Playwright's bundled Chromium happens to be
+ * permissive about it, so this suite passed locally for a long time; real
+ * Google Chrome is not, and on a CI runner every test stalled on its
+ * waitForSelector until the job was killed.
+ *
+ * Serving over http://127.0.0.1 is also the more honest test, because http(s)
+ * is the only surface the extension claims: background.js's isInjectable()
+ * accepts nothing else, so a file:// page was never something a user could
+ * digitize anyway.
+ *
+ * The server holds no state beyond the bytes it serves, listens on an
+ * ephemeral port so parallel runs cannot collide, and is unref'd as well as
+ * closed — a listening handle would keep the test runner alive after the last
+ * test, which is exactly the hang this file has to avoid now that
+ * --test-force-exit is gone.
+ * ------------------------------------------------------------------- */
+const http = require('node:http');
+
+let fixtureServer = null;
+let fixtureOrigin = null;
+const served = new Map();
+
+async function fixtureBase() {
+  if (fixtureOrigin) return fixtureOrigin;
+  served.set('/stub-map.html', {
+    body: fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'stub-map.html')),
+    type: 'text/html; charset=utf-8',
+  });
+  fixtureServer = http.createServer((req, res) => {
+    const hit = served.get(String(req.url || '').split('?')[0]);
+    if (!hit) { res.statusCode = 404; res.end('not found'); return; }
+    res.setHeader('Content-Type', hit.type);
+    res.end(hit.body);
+  });
+  await new Promise((resolve) => fixtureServer.listen(0, '127.0.0.1', resolve));
+  fixtureServer.unref();
+  fixtureOrigin = `http://127.0.0.1:${fixtureServer.address().port}`;
+  return fixtureOrigin;
+}
+
+const fixtureUrl = async () => `${await fixtureBase()}/stub-map.html`;
 
 // Injection is driven through the worker's own activate(), so the real ordering
 // and world assignment in background.js are what gets exercised.
@@ -137,7 +190,7 @@ async function openFixtureWithExtension() {
   const { sw } = await launch();
   const page = await ctx.newPage();
   openPages.push(page);
-  await page.goto(FIXTURE);
+  await page.goto(await fixtureUrl());
   await page.waitForFunction(() => !!window.map, null, { timeout: 10000 });
 
   // Identify this page's own tab by its unique query string, so concurrently
@@ -406,12 +459,16 @@ function minimalPdf() {
 
 t('a real PDF in Chrome\'s viewer can be captured and digitized', async () => {
   const { sw } = await launch();
-  const pdfPath = path.join(tmpRoot, 'sheet.pdf');
-  fs.writeFileSync(pdfPath, minimalPdf(), 'latin1');
+  // Served over HTTP for the same reason as the stub map: captureVisibleTab
+  // needs a host permission that matches the tab, and <all_urls> does not
+  // match file://. Chrome's PDFium viewer renders an http-served PDF exactly
+  // as it renders a local one, which is the thing under test here.
+  const base = await fixtureBase();
+  served.set('/sheet.pdf', { body: Buffer.from(minimalPdf(), 'latin1'), type: 'application/pdf' });
 
   const page = await ctx.newPage();
   openPages.push(page);
-  await page.goto('file://' + pdfPath);
+  await page.goto(`${base}/sheet.pdf`);
   // PDFium needs a moment to lay out and paint the page.
   await page.waitForTimeout(3500);
 
@@ -517,6 +574,12 @@ t('an export produces a real download in Chrome', async () => {
     () => /Shape 1/.test(document.querySelector('#bnd15-widget').textContent),
     null, { timeout: 15000 });
 
+  // Export lives behind the Export ▾ menu since 17.0, so a real browser has to
+  // open it first — this is the one suite that enforces genuine visibility,
+  // because jsdom has no layout and will happily click a hidden button.
+  await page.click('#bnd15-widget #btnExport');
+  await page.waitForSelector('#bnd15-widget #menuExport.open', { timeout: 5000 });
+
   const [download] = await Promise.all([
     page.waitForEvent('download', { timeout: 15000 }),
     page.click('#bnd15-widget #xGeo'),
@@ -583,7 +646,7 @@ t('as shipped, injection is refused until the user invokes the extension', async
     if (!sw) sw = await localCtx.waitForEvent('serviceworker', { timeout: 20000 });
 
     const page = await localCtx.newPage();
-    await page.goto(FIXTURE);
+    await page.goto(await fixtureUrl());
     await page.waitForFunction(() => !!window.map, null, { timeout: 10000 });
 
     // A stronger confirmation than expected: with no host access the extension
@@ -657,7 +720,11 @@ t('a full session raises no page or worker errors', async () => {
   const text = await page.textContent('#bnd15-widget');
   assert.match(text, /1 active/, `a control point should exist: ${text.slice(0, 300)}`);
 
-  // Clean-up and report.
+  // Clean-up and report. The section collapses since 17.0, so it is expanded
+  // the way an operator would — by its summary — rather than by reaching past
+  // the UI to the buttons inside it.
+  await page.click('#bnd15-widget details.sect[data-sect="cleanup"] > summary');
+  await page.waitForSelector('#bnd15-widget details.sect[data-sect="cleanup"][open]', { timeout: 5000 });
   await page.click('#bnd15-widget #regAll');
   await page.waitForTimeout(500);
   await page.click('#bnd15-widget #qual');

@@ -141,8 +141,10 @@
     // silently — 300 dpi is only the starting value in the field.
     scanDpi: 300,
     // Which collapsible sections start open. The map is the point of the
-    // screen, so most of the panel starts closed (brief §7).
-    openSections: ['workflow', 'io'],
+    // screen, so most of the panel starts closed (brief §7). Import and Export
+    // are not in this list because they are not sections — they are two of the
+    // three permanent buttons, and their menus open from those.
+    openSections: ['workflow'],
   };
 
   function loadSettings() {

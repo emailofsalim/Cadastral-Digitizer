@@ -8,12 +8,14 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
-**Tests:** `npm test` — 549 tests. No install needed: 477 run immediately, and 72 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 552 tests. No install needed: 480 run immediately, and 72 that need a browser skip cleanly. To enable those:
 
 ```bash
 npm install --no-save jsdom            # 58 DOM integration tests
 npm install --no-save playwright-core  # 14 real-Chrome E2E tests (needs a Chrome binary)
 ```
+
+**CI:** `.github/workflows/test.yml` runs the suite twice on every push and pull request. Once against a **bare checkout with nothing installed**, because "most of it runs the moment you unzip it" is a promise the project makes and a change could quietly break while every other check stayed green; and once with both optional dependencies plus the runner's Chrome, where **no test may skip** — a silently skipped end-to-end run must not be mistakable for a passing one.
 
 ---
 

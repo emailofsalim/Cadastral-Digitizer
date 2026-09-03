@@ -1173,3 +1173,50 @@ test('R18-x: the centroid and area are stable at real UTM magnitudes', () => {
   assert.ok(Math.abs(rotated - area0) < 1e-6,
     `area changed by ${Math.abs(rotated - area0)} m² under a pure rotation`);
 });
+
+test('R18-7b: every default-open section names a section that exists', () => {
+  // 'io' was in this list from an earlier design in which Import/Export was a
+  // collapsible section rather than two of the three permanent buttons. It
+  // named nothing, so it silently did nothing — the same class of decorative
+  // setting the suite already guards against elsewhere.
+  const block = PAGE.match(/const DEFAULT_SETTINGS = \{([\s\S]*?)\n  \};/)[1];
+  const defaults = (block.match(/openSections:\s*\[([^\]]*)\]/) || [])[1] || '';
+  const wanted = [...defaults.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+  assert.ok(wanted.length, 'some section should start open');
+  const declared = new Set([...PAGE.matchAll(/section\('([^']+)'/g)].map((m) => m[1]));
+  for (const key of wanted) {
+    assert.ok(declared.has(key),
+      `openSections names "${key}", but no section('${key}', ...) exists — it would open nothing`);
+  }
+});
+
+test('R18-7c: a control behind a collapsed section is reachable by opening it', () => {
+  // jsdom has no layout, so it will click a hidden button and report success.
+  // Real Chrome will not. The E2E suite is what enforces this, and it must
+  // drive the UI the way an operator does rather than reaching past it.
+  const e2e = read('test/chrome_e2e.test.js');
+  assert.match(e2e, /details\.sect\[data-sect="cleanup"\] > summary/,
+    'the E2E suite must expand a section before using the controls inside it');
+  assert.match(e2e, /#btnExport/,
+    'and open the Export menu before clicking an export');
+});
+
+test('R16g: the end-to-end suite drives the extension over http, never file://', () => {
+  // An extension's host permissions, <all_urls> included, do not grant access
+  // to file:// pages — Chrome gates that behind a separate per-extension
+  // setting no manifest or command-line flag can supply. Playwright's bundled
+  // Chromium is permissive about it and real Chrome is not, so a file:// URL
+  // here passes locally and stalls every test on a CI runner until the job is
+  // killed. It is also simply not a surface the extension supports:
+  const bg = read('background.js');
+  assert.match(bg, /\^https\?:\\\/\\\//,
+    'isInjectable must accept http(s) only, which is why file:// cannot be a fixture');
+
+  const e2e = read('test/chrome_e2e.test.js');
+  const code = e2e.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(!/['"`]file:\/\//.test(code),
+    'no fixture may be opened as a file:// URL; serve it over http://127.0.0.1 instead');
+  assert.match(code, /http\.createServer/, 'the fixtures must be served');
+  assert.match(code, /fixtureServer\.unref\(\)/,
+    'and the listening socket must not be able to hold the runner open');
+});
