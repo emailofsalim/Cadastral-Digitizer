@@ -1,0 +1,8 @@
+# jsdom is an optional dev dependency for the browser-integration tests only.
+# The extension itself has no runtime dependencies and ships unbundled.
+node_modules/
+package-lock.json
+
+# Scratch
+*.log
+.DS_Store

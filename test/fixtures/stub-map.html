@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stub cadastral map — E2E fixture</title>
+<style>
+  html,body{margin:0;height:100%;background:#1e293b;font:13px system-ui,sans-serif;color:#e2e8f0}
+  #map{position:absolute;left:0;top:0;width:600px;height:400px;overflow:hidden}
+  #map canvas{display:block}
+  #log{position:absolute;left:610px;top:0;padding:8px;font:11px monospace;color:#94a3b8}
+</style>
+</head>
+<body>
+<!-- A stand-in for a cadastral portal: a REAL canvas with parcels painted on it,
+     plus a window.map exposing the OpenLayers interface the digitizer detects.
+     Everything here is genuine rendering, so the extension's colour tracing runs
+     against real rasterised pixels rather than a stubbed getImageData. -->
+<div id="map"><canvas id="c" width="600" height="400"></canvas></div>
+<div id="log">fixture ready</div>
+
+<script>
+(function () {
+  'use strict';
+  const W = 600, H = 400;
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  // Four parcels of differing pale washes, each ringed by a dark boundary, on a
+  // page-coloured background. Sizes are exact so expected areas are known.
+  const PAGE = '#cde6f0';
+  const WALL = '#141414';
+  window.__PARCELS__ = [
+    { x: 150, y: 100, w: 300, h: 200, fill: '#f0dcb4' },
+    { x: 40,  y: 40,  w: 80,  h: 60,  fill: '#c8e6f0' },
+    { x: 40,  y: 300, w: 90,  h: 70,  fill: '#d7f0cd' },
+    { x: 480, y: 60,  w: 90,  h: 90,  fill: '#f5cdd7' }
+  ];
+
+  function paint() {
+    ctx.fillStyle = PAGE;
+    ctx.fillRect(0, 0, W, H);
+    for (const p of window.__PARCELS__) {
+      ctx.fillStyle = WALL;
+      ctx.fillRect(p.x - 3, p.y - 3, p.w + 6, p.h + 6);
+      ctx.fillStyle = p.fill;
+      ctx.fillRect(p.x, p.y, p.w, p.h);
+    }
+  }
+  paint();
+
+  // ---- OpenLayers-shaped view over UTM 45N at exactly 0.5 m per pixel ----
+  const M_PER_PX = 0.5;
+  const state = { centre: [432500, 2618400], zoom: 19 };
+  const listeners = {};
+
+  const view = {
+    getZoom: () => state.zoom,
+    setZoom: (z) => { state.zoom = z; emit('postrender'); },
+    getCenter: () => state.centre.slice(),
+    setCenter: (c) => { state.centre = c.slice(); emit('postrender'); },
+    getMinZoom: () => 0,
+    getMaxZoom: () => 24,
+    setMinZoom: () => {},
+    setMaxZoom: () => {},
+    getResolution: () => M_PER_PX,
+    getProjection: () => ({ getCode: () => 'EPSG:32645' })
+  };
+
+  function emit(ev) { (listeners[ev] || []).forEach(function (f) { f(); }); }
+
+  window.map = {
+    getView: () => view,
+    getViewport: () => document.getElementById('map'),
+    getCoordinateFromPixel: (px) => [
+      state.centre[0] + (px[0] - W / 2) * M_PER_PX,
+      state.centre[1] - (px[1] - H / 2) * M_PER_PX
+    ],
+    getPixelFromCoordinate: (c) => [
+      (c[0] - state.centre[0]) / M_PER_PX + W / 2,
+      (state.centre[1] - c[1]) / M_PER_PX + H / 2
+    ],
+    getLayers: () => ({ getArray: () => [] }),
+    on: (ev, cb) => { (listeners[ev] = listeners[ev] || []).push(cb); },
+    un: (ev, cb) => { listeners[ev] = (listeners[ev] || []).filter(function (f) { return f !== cb; }); }
+  };
+
+  // Count clicks that reach the page, so click-leakage can be measured from
+  // the outside exactly as a real portal would experience it.
+  window.__SITE_CLICKS__ = 0;
+  document.getElementById('map').addEventListener('click', function () {
+    window.__SITE_CLICKS__++;
+    document.getElementById('log').textContent = 'site clicks: ' + window.__SITE_CLICKS__;
+  });
+})();
+</script>
+</body>
+</html>

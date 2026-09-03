@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  body{width:290px;margin:0;padding:14px;background:#07111f;color:#e5e7eb;
+       font:13px/1.5 "Segoe UI",system-ui,Arial,sans-serif}
+  h1{margin:0 0 4px;font-size:14px}
+  .ver{color:#64748b;font-size:11px;margin-bottom:10px}
+  button{width:100%;border:0;border-radius:9px;padding:10px;font-size:13px;font-weight:700;
+         color:#fff;background:linear-gradient(135deg,#0ea5e9,#1d4ed8);cursor:pointer}
+  button:hover:not(:disabled){filter:brightness(1.1)}
+  button:disabled{opacity:.55;cursor:default}
+  #status{margin-top:9px;font-size:11.5px;color:#94a3b8;min-height:2.6em}
+  #status.ok{color:#6ee7b7}
+  #status.err{color:#fca5a5}
+  ul{margin:10px 0 0;padding-left:16px;color:#64748b;font-size:11px}
+  li{margin-bottom:3px}
+  kbd{background:#1e293b;border:1px solid #334155;border-radius:4px;padding:0 4px;font-size:10px}
+  .credit{margin-top:11px;padding-top:9px;border-top:1px solid #1e293b;
+          font-size:10.5px;color:#475569;text-align:center;line-height:1.5}
+  .credit b{color:#94a3b8}
+</style>
+</head>
+<body>
+  <h1>🧭 Cadastral Digitizer</h1>
+  <div class="ver">v17.0.0 · map portals, images and PDFs</div>
+  <button id="showBtn">Open on this page</button>
+  <div id="status">Opens on the tab you are viewing. Access is granted for this tab only.</div>
+  <ul>
+    <li>OpenLayers, Leaflet, MapLibre, Mapbox GL, Google Maps</li>
+    <li>Scanned sheets, images and PDF pages too</li>
+    <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd> toggles the widget</li>
+    <li>Pan and zoom stay available in every mode</li>
+  </ul>
+  <div class="credit">Developed by <b>Md Salim Ansari</b><br>MIT licence</div>
+  <script src="popup.js"></script>
+</body>
+</html>
