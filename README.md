@@ -8,10 +8,10 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
-**Tests:** `npm test` — 552 tests. No install needed: 480 run immediately, and 72 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 565 tests. No install needed: 489 run immediately, and 76 that need a browser skip cleanly. To enable those:
 
 ```bash
-npm install --no-save jsdom            # 58 DOM integration tests
+npm install --no-save jsdom            # 62 DOM integration tests
 npm install --no-save playwright-core  # 14 real-Chrome E2E tests (needs a Chrome binary)
 ```
 
@@ -40,11 +40,23 @@ Imported rings become **ordinary shapes**. Not a separate layer type with its ow
 
 **They are overlaid automatically.** Coordinates in the file are used as they are, so a DXF holding real eastings and northings lands where those eastings and northings are, and the *view* moves to the imported extent — never the geometry to the view.
 
-**The coordinate system is asked for, not guessed.** KML and GeoJSON declare WGS 84 by specification, so those import straight through. A DXF or a CSV of plain numbers cannot say what system it is in; where the session already knows, the import adopts it and says so, and where neither knows, the import stops and asks. This is the same refusal `lib/crs.js` already makes about UTM zones, for the same reason: a wrong guess puts parcels in the wrong district and nothing downstream notices.
+**The coordinate system is converted when it is known, and asked for when it is not.** See below — this is the distinction the whole import path turns on.
 
 **Unsupported content is skipped with a reason.** A cadastral KMZ routinely carries ground overlays, network links and 3D models; a DXF carries circles and splines with no vertex list. Refusing the whole file over one unreadable placemark is the wrong trade when the other forty parcels are good, so each is counted and named.
 
 KMZ inflation uses the platform's `DecompressionStream('deflate-raw')`, present in Chrome and in Node ≥18, rather than bundling an inflate implementation that could not be tested here.
+
+### Coordinate systems: convert what is known, ask about what is not
+
+Everything here rests on one distinction. Converting between two coordinate systems is **arithmetic** when both ends are actually known, and a **fabrication** when either is not. Those two cases deserve opposite treatment, and the first version of this release got the first case wrong.
+
+**Converted, automatically.** KML and GeoJSON declare WGS 84 lon/lat by specification. A session on a BhuNaksha portal knows its own UTM zone. Both ends are known, so importing one into the other is exact and simply happens — the parcels land in the right place, and the panel says what was converted from what. An earlier build *refused* here and told the operator to go and reproject the file themselves, which was work the program could do exactly and they could only do approximately. That refusal is gone.
+
+**Asked, never guessed.** A DXF or a CSV of bare numbers cannot say what system it is in, and neither can the session on a portal that declares nothing. Here a guess would put parcels in the wrong district with nothing downstream noticing, so the import **stops and asks** — and the parsed file is *held* while it does, so answering finishes the import rather than making you find the file again. The question carries the one thing the numbers genuinely can say: their **family**. Degree-range, Web Mercator range and projected-grid magnitudes are disjoint, so the panel will tell you "these look like a projected grid such as UTM" — and then stop, because the numbers cannot say *which zone* and inventing one is the error being avoided.
+
+**Exports convert too.** The session works in whatever the portal serves, but a KMZ for Google Earth wants lon/lat. The Export menu carries a coordinate-system selector; choosing one converts the geometry on the way out, exactly, and leaves the session's own geometry untouched. Doing it here beats doing it afterwards in another tool, which is a second chance to get a zone wrong.
+
+**One caveat, surfaced rather than swallowed.** `toWgs84` applies a datum shift; `fromWgs84` deliberately does not apply the inverse, because published Kalianpur/Everest parameters vary by source and region and are worth tens of metres — the project's standing policy is that datum shifts are never applied unless explicitly selected. So a conversion *into* a non-WGS 84 datum uses that datum's ellipsoid but not its shift, and the panel says so in as many words. Emitting coordinates tens of metres out on a cadastral boundary, silently, would be the worst of the available behaviours.
 
 ### Moving a parcel, non-destructively
 

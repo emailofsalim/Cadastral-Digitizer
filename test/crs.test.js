@@ -454,3 +454,109 @@ test('point scale factor grows away from the central meridian', () => {
   // ~300 km off the CM it exceeds a part per thousand in area.
   assert.ok(nearEdge > 1.0, `scale exceeds unity near the edge: ${nearEdge}`);
 });
+
+/* =====================================================================
+ * REPROJECTION BETWEEN TWO KNOWN COORDINATE SYSTEMS
+ *
+ * Added in 17.0 so a lon/lat KML can be imported into a projected session
+ * instead of being refused. The refusal was over-cautious: converting out of
+ * an UNKNOWN system is a fabrication, but converting out of a DECLARED one is
+ * arithmetic, and KML declares WGS 84 by specification.
+ * =================================================================== */
+
+const UTM45 = { kind: 'utm', zone: 45, north: true, datum: 'WGS84', label: 'WGS 84 / UTM 45N' };
+const GEO = { kind: 'geographic', datum: 'WGS84', epsg: 4326, label: 'WGS 84 lon/lat' };
+
+test('reproject: lon/lat to UTM and back is exact', () => {
+  // Jharkhand, the deployment this project was built for.
+  const lonLat = [85.3096, 23.3441];
+  const utm = C.reproject(lonLat[0], lonLat[1], GEO, UTM45);
+  assert.ok(utm, 'the conversion must be possible');
+  // Sanity: a Jharkhand point in zone 45 lands in plausible UTM territory.
+  assert.ok(utm[0] > 100000 && utm[0] < 900000, `easting out of range: ${utm[0]}`);
+  assert.ok(utm[1] > 2000000 && utm[1] < 3000000, `northing out of range: ${utm[1]}`);
+
+  const back = C.reproject(utm[0], utm[1], UTM45, GEO);
+  const err = C.geodesicDistance(lonLat[0], lonLat[1], back[0], back[1]);
+  assert.ok(err < 1e-3, `round trip must be exact, off by ${err} m`);
+});
+
+test('reproject: a converted parcel keeps its real area', () => {
+  // The strongest available check, because it compares two INDEPENDENT code
+  // paths: geodesic area on the lon/lat ring against plain grid area on the
+  // projected one. A transposed axis or a wrong zone would not agree.
+  const Exp = require('../lib/exporters.js');
+  const ring = [[85.3096, 23.3441], [85.3106, 23.3441], [85.3106, 23.3451], [85.3096, 23.3451]];
+  const out = C.reprojectRing(ring, GEO, UTM45);
+  assert.strictEqual(out.ok, true);
+  assert.strictEqual(out.failed, 0);
+  const geodesic = Exp.geodesicArea(ring);
+  const grid = Exp.gridArea(out.points);
+  assert.ok(Math.abs(grid / geodesic - 1) < 0.001,
+    `areas must agree: geodesic ${geodesic} vs projected ${grid}`);
+});
+
+test('reproject: an identical CRS is a no-op that does not alias', () => {
+  const ring = [[327190, 2582622], [327290, 2582622], [327290, 2582722]];
+  const out = C.reprojectRing(ring, UTM45, { kind: 'utm', zone: 45, north: true, datum: 'WGS84' });
+  assert.strictEqual(out.unchanged, true);
+  assert.deepStrictEqual(out.points, ring);
+  out.points[0][0] = 0;
+  assert.strictEqual(ring[0][0], 327190, 'the input must not be mutated');
+});
+
+test('crsEquivalent compares what changes the numbers, not object identity', () => {
+  assert.strictEqual(C.crsEquivalent(UTM45, { kind: 'utm', zone: 45, north: true }), true,
+    'an absent datum means WGS84, so these are the same system');
+  assert.strictEqual(C.crsEquivalent(UTM45, { kind: 'utm', zone: 44, north: true }), false, 'zone matters');
+  assert.strictEqual(C.crsEquivalent(UTM45, { kind: 'utm', zone: 45, north: false }), false, 'hemisphere matters');
+  assert.strictEqual(C.crsEquivalent(UTM45, GEO), false, 'kind matters');
+  assert.strictEqual(C.crsEquivalent(UTM45, { kind: 'utm', zone: 45, north: true, datum: 'KALIANPUR_1975' }), false,
+    'datum matters, and is exactly the case that must not be treated as equivalent');
+  assert.strictEqual(C.crsEquivalent(null, UTM45), false);
+});
+
+test('a conversion into a non-WGS84 datum is reported as approximate, not silently done', () => {
+  // fromWgs84 applies the target datum's ELLIPSOID but not its SHIFT, because
+  // published Kalianpur parameters vary by source and are worth tens of
+  // metres. That is the project's standing policy; the point here is that the
+  // caveat is surfaced rather than the error being emitted silently onto a
+  // cadastral boundary.
+  const kalianpur = { kind: 'utm', zone: 45, north: true, datum: 'KALIANPUR_1975', label: 'Kalianpur 1975 / UTM 45N' };
+  const plan = C.describeReprojection(GEO, kalianpur);
+  assert.strictEqual(plan.needed, true);
+  assert.strictEqual(plan.possible, true);
+  assert.strictEqual(plan.exact, false, 'it must not claim to be exact');
+  assert.strictEqual(plan.datumCaveat, true);
+  assert.match(plan.message, /datum/i);
+  assert.match(plan.message, /tens of metres|approximate/i, 'and must quantify the risk');
+});
+
+test('a same-datum conversion is reported as exact', () => {
+  const plan = C.describeReprojection(GEO, UTM45);
+  assert.strictEqual(plan.needed, true);
+  assert.strictEqual(plan.exact, true);
+  assert.strictEqual(plan.datumCaveat, false);
+  assert.match(plan.message, /exact/);
+});
+
+test('describeReprojection says when nothing needs doing, and when it cannot', () => {
+  assert.strictEqual(C.describeReprojection(UTM45, UTM45).needed, false);
+  const impossible = C.describeReprojection(null, UTM45);
+  assert.strictEqual(impossible.possible, false);
+  assert.match(impossible.message, /unknown/i);
+});
+
+test('reproject refuses rather than emitting NaN for an unusable CRS', () => {
+  assert.strictEqual(C.reproject(1, 1, GEO, { kind: 'nonsense' }), null);
+  assert.strictEqual(C.reproject(1, 1, { kind: 'nonsense' }, GEO), null);
+  assert.strictEqual(C.reproject(1, 1, GEO, null), null);
+  const bad = C.reprojectRing([[1, 1], [2, 2], [3, 3]], GEO, { kind: 'nonsense' });
+  assert.strictEqual(bad.ok, false);
+  assert.strictEqual(bad.failed, 3, 'every failed vertex must be counted');
+});
+
+test('a ring reduced below three vertices by conversion is not returned as a parcel', () => {
+  const out = C.reprojectRing([[1, 1], [2, 2]], GEO, UTM45);
+  assert.strictEqual(out.ok, false, 'two points bound no area');
+});

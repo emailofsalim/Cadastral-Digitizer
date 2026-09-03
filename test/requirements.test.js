@@ -930,13 +930,25 @@ test('R18-2: an import overlays automatically and never repositions geometry', (
     'imported coordinates must be carried through unchanged');
 });
 
-test('R18-2b: an import asks for the CRS rather than guessing it', () => {
+test('R18-2b: an import asks when the CRS is unknown, and converts when it is not', () => {
+  // Two different situations that must not be conflated. With NO declared
+  // system, guessing would put parcels in the wrong district, so it asks. With
+  // a declared one, the conversion to the session's system is arithmetic, so it
+  // converts -- and says so.
   assert.match(PAGE, /function resolveImportCrs\(/);
   const fn = PAGE.match(/function resolveImportCrs\([\s\S]*?\n  \}/)[0];
   assert.match(fn, /ask: true/, 'with no evidence it must ask, not assume');
   assert.match(fn, /not stated in the file/);
-  // And a lon/lat file must not be silently dropped into a projected session.
-  assert.match(fn, /near the equator/);
+  assert.match(fn, /Crs\.crsEquivalent\(result\.crs, sessionCrs\)/,
+    'a declared but different system must be detected');
+  assert.match(fn, /convertFrom: result\.crs/,
+    'and converted rather than refused');
+  assert.match(PAGE, /Crs\.reprojectRing\(r\.points, crsCheck\.convertFrom, crsCheck\.crs\)/,
+    'the geometry must actually be reprojected before it becomes a shape');
+  // An inexact conversion -- one into a datum whose shift this build does not
+  // apply -- has to be stated at import time.
+  assert.match(PAGE, /!crsCheck\.plan\.exact/,
+    'an approximate conversion must be reported, not done silently');
 });
 
 test('R18-3/4: move, rotate and scale exist and record a separate shift', () => {

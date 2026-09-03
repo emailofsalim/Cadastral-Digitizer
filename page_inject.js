@@ -140,6 +140,10 @@
     // cannot give a ground scale, so this is asked for rather than assumed
     // silently — 300 dpi is only the starting value in the field.
     scanDpi: 300,
+    // Write exports in this EPSG code instead of the session's own coordinate
+    // system, converting on the way out. Empty means "the session's own",
+    // which is the default and the common case.
+    exportCrsEpsg: '',
     // Which collapsible sections start open. The map is the point of the
     // screen, so most of the panel starts closed (brief §7). Import and Export
     // are not in this list because they are not sections — they are two of the
@@ -224,6 +228,9 @@
     // A CSV waiting on the operator to confirm its format. Nothing is imported
     // until they do (brief §6, §17).
     csvDialog: null,
+    // An import waiting for the operator to name its coordinate system,
+    // because neither the file nor the session declares one.
+    crsAsk: null,
     // Which of the three main menus is open, if any (brief §1).
     openMenu: null,              // 'import' | 'export' | null
     importSummary: null,         // what the last import brought in
@@ -311,11 +318,49 @@
 
   // Shapes as they should leave the extension: georeferenced if possible, and
   // otherwise honestly still in pixels.
+  /* The coordinate system the session's own geometry is in. */
+  function sessionCrs() {
+    return isWorkspace() ? (st.georef && st.georef.crs) : st.crs;
+  }
+
+  /* The coordinate system exports are WRITTEN in. Normally the session's own,
+   * but the operator can choose another and have the geometry converted on the
+   * way out — a KMZ for Google Earth wants lon/lat while the session works in
+   * UTM, and doing that conversion here is exact, whereas doing it afterwards
+   * in another tool is a second chance to get a zone wrong. */
+  function exportCrs() {
+    const base = sessionCrs();
+    if (!S.exportCrsEpsg) return base;
+    const chosen = safe(() => Crs.parseEpsg(S.exportCrsEpsg), null);
+    return chosen || base;
+  }
+
+  /* Shapes as the exporters should see them: workspace pixels resolved to real
+   * coordinates first, then converted into the chosen export CRS if that
+   * differs from the session's. One place, so no exporter can disagree with
+   * another about what it is writing. */
   function shapesForExport() {
-    if (!isWorkspace() || !hasGeoref()) return st.shapes;
-    return st.shapes.map((s) => Object.assign({}, s, {
-      points: s.points.map(toCrsCoord),
-    }));
+    let shapes = st.shapes;
+    if (isWorkspace() && hasGeoref()) {
+      shapes = st.shapes.map((s) => Object.assign({}, s, { points: s.points.map(toCrsCoord) }));
+    }
+    const from = sessionCrs();
+    const to = exportCrs();
+    if (!from || !to || Crs.crsEquivalent(from, to)) return shapes;
+    return shapes.map((s) => {
+      const r = Crs.reprojectRing(s.points, from, to);
+      return r.ok ? Object.assign({}, s, { points: r.points }) : s;
+    });
+  }
+
+  /* Whether the chosen export CRS is actually reachable, and what it would
+   * cost. Reported before writing rather than after. */
+  function exportConversionPlan() {
+    const from = sessionCrs();
+    const to = exportCrs();
+    if (!from || !to) return null;
+    if (Crs.crsEquivalent(from, to)) return null;
+    return Crs.describeReprojection(from, to);
   }
 
   function scaleFactorAt(points) {
@@ -520,6 +565,7 @@
     st.lastWarning = null;
     st.mode = 'idle';
     st.csvDialog = null;
+    st.crsAsk = null;
     st.importSummary = null;
     st.openMenu = null;
     // Georeferencing points and the drawing scale both belong to an open raster
@@ -1632,15 +1678,22 @@
    * have reprojected is how coordinates end up subtly wrong. */
   function resolveImportCrs(result, what) {
     const sessionCrs = isWorkspace() ? (st.georef && st.georef.crs) : st.crs;
-    if (result.crs && result.crs.kind === 'geographic') {
-      if (sessionCrs && sessionCrs.kind !== 'geographic') {
-        return {
-          ok: false,
-          error: `This ${what} holds longitude/latitude, but this session is working in ${Crs.describeCrs(sessionCrs)}. Importing it as-is would put the parcels near the equator. Convert the file to the session's coordinate system first, or start a session on a lon/lat map.`,
-        };
+
+    // The file declares its own system AND the session has one: convert.
+    // Both ends are known, so this is arithmetic rather than a guess — the
+    // same reason detectCrs refuses to invent a zone is the reason it is safe
+    // to convert out of a declared one. Earlier builds refused here and told
+    // the operator to go and reproject the file themselves, which was work the
+    // program could do exactly and they could only do approximately.
+    if (result.crs && sessionCrs && !Crs.crsEquivalent(result.crs, sessionCrs)) {
+      const plan = Crs.describeReprojection(result.crs, sessionCrs);
+      if (!plan.possible) {
+        return { ok: false, error: `This ${what} cannot be converted to ${Crs.describeCrs(sessionCrs)}: ${plan.message}` };
       }
-      return { ok: true, crs: result.crs, adopted: !sessionCrs };
+      return { ok: true, crs: sessionCrs, adopted: false, convertFrom: result.crs, plan };
     }
+
+    if (result.crs && sessionCrs) return { ok: true, crs: sessionCrs, adopted: false };
     if (sessionCrs) return { ok: true, crs: sessionCrs, adopted: false };
     if (result.crs) return { ok: true, crs: result.crs, adopted: true };
     return {
@@ -1657,9 +1710,42 @@
     const o = opts || {};
     const crsCheck = resolveImportCrs(result, o.what || 'file');
     if (!crsCheck.ok) {
+      if (crsCheck.ask) {
+        // Neither the file nor the session states a coordinate system, so the
+        // numbers alone cannot say where on Earth they are — the same reason
+        // detectCrs offers sixty candidates rather than picking one. The
+        // import is HELD rather than thrown away: the operator names the
+        // system and it proceeds, instead of having to find the file again.
+        st.crsAsk = { result, opts: o, epsg: '' };
+        renderWidget();
+        toast(crsCheck.error, 'warn', 12000);
+        return false;
+      }
       toastErr(crsCheck.error);
       return false;
     }
+    // Convert the geometry into the session's coordinate system where the file
+    // is in a different — but declared — one. Done before makeShape so every
+    // downstream consumer sees ordinary session coordinates and nothing needs
+    // to know an import happened.
+    let converted = 0;
+    let dropped = 0;
+    if (crsCheck.convertFrom) {
+      const out = [];
+      for (const r of result.rings) {
+        const rp = Crs.reprojectRing(r.points, crsCheck.convertFrom, crsCheck.crs);
+        if (!rp.ok) { dropped++; continue; }
+        if (rp.failed) result.skipped.push({ what: `${rp.failed} vertex/vertices of "${r.plotNo || r.name || 'a parcel'}"`, why: 'could not be expressed in the session coordinate system' });
+        out.push(Object.assign({}, r, { points: rp.points }));
+        converted++;
+      }
+      if (!out.length) {
+        return (toastErr(`None of the ${result.rings.length} parcel(s) could be converted from ${Crs.describeCrs(crsCheck.convertFrom)} to ${Crs.describeCrs(crsCheck.crs)}. The coordinates may fall outside the target zone.`), false);
+      }
+      if (dropped) result.skipped.push({ what: `${dropped} parcel(s)`, why: `fewer than three vertices survived conversion to ${Crs.describeCrs(crsCheck.crs)}` });
+      result = Object.assign({}, result, { rings: out });
+    }
+
     commit(`import ${result.rings.length} parcel(s) from ${o.what || 'a file'}`);
     const added = [];
     for (const r of result.rings) {
@@ -1695,6 +1781,9 @@
       warnings: result.warnings || [],
       crsLabel: Crs.describeCrs(crsCheck.crs),
       adoptedCrs: !!crsCheck.adopted,
+      convertedFrom: crsCheck.convertFrom ? Crs.describeCrs(crsCheck.convertFrom) : null,
+      conversionExact: crsCheck.plan ? crsCheck.plan.exact : null,
+      conversionNote: crsCheck.plan ? crsCheck.plan.message : null,
       layers: [...new Set(added.map((s) => s.layer))],
       withPlotNo: added.filter((s) => s.plotNo != null).length,
     };
@@ -1702,9 +1791,15 @@
     zoomToImported(added);
 
     const bits = [`${added.length} parcel(s) imported and overlaid`];
+    if (crsCheck.convertFrom) bits.push(`converted from ${Crs.describeCrs(crsCheck.convertFrom)} to ${Crs.describeCrs(crsCheck.crs)}`);
     if (st.importSummary.withPlotNo) bits.push(`${st.importSummary.withPlotNo} with a plot number`);
     if (result.skipped && result.skipped.length) bits.push(`${result.skipped.length} item(s) skipped`);
     toastOk(bits.join(' · ') + '.');
+    // An inexact conversion — one into a datum whose shift this build does not
+    // apply — has to be stated at import time, not buried in a panel.
+    if (crsCheck.plan && crsCheck.plan.needed && !crsCheck.plan.exact) {
+      toast(crsCheck.plan.message, 'warn', 14000);
+    }
     (result.warnings || []).forEach((w) => toast(w, 'warn', 9000));
     if (crsCheck.adopted) {
       toast(`Coordinate system taken from the file: ${Crs.describeCrs(crsCheck.crs)}. Check it in the panel before exporting.`, 'info', 8000);
@@ -1760,7 +1855,11 @@
         // A KMZ is a ZIP and starts "PK"; a KML is XML. The magic number is
         // checked rather than the extension, because files get renamed.
         const isZip = bytes.length > 3 && bytes[0] === 0x50 && bytes[1] === 0x4b;
-        result = isZip ? await Imp.parseKmz(bytes) : Imp.parseKml(new TextDecoder().decode(bytes));
+        // Decoded through the importers' own utf8Decode rather than a second
+        // `new TextDecoder()` here. That constructor is not on every window
+        // this code can run in, and the library already carries a guarded
+        // decoder — two decoders is one more than can be kept correct.
+        result = isZip ? await Imp.parseKmz(bytes) : Imp.parseKml(Imp.utf8Decode(bytes));
       } else if (kind === 'csv') {
         // CSV needs the format confirming first, so it takes the dialog route
         // and returns here only once the operator has pressed Import.
@@ -2658,8 +2757,6 @@
   // In workspace mode the shapes handed to the exporters are already in CRS
   // coordinates (see shapesForExport), so toLonLat here must convert FROM that
   // CRS rather than from pixels again.
-  function exportCrs() { return isWorkspace() ? (st.georef && st.georef.crs) : st.crs; }
-
   function exportOpts() {
     const crs = exportCrs();
     return {
@@ -2879,6 +2976,10 @@ padding:5px;background:rgba(2,6,23,.7)}
 .bnd15-menu.open{display:block}
 .bnd15-menu .mh{font-size:10.5px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;color:#94a3b8;padding:2px 4px 4px}
 .bnd15-menu .mn{font-size:10px;color:#64748b;padding:5px 4px 2px;border-top:1px solid rgba(148,163,184,.18);margin-top:4px;line-height:1.4}
+.bnd15-menu .mcrs{padding:6px 4px 2px;border-top:1px solid rgba(148,163,184,.18);margin-top:4px}
+.bnd15-menu .mcrs label{display:block;font-size:10px;color:#94a3b8;margin-bottom:3px}
+.bnd15-menu .mcrs select{width:100%}
+.bnd15-menu .mcrs .dim,.bnd15-menu .mcrs .warn{font-size:10px;margin-top:3px;line-height:1.35}
 .bnd15-mi{display:block;width:100%;text-align:left;border:0;background:transparent;color:#e5e7eb;
 padding:6px 8px;border-radius:7px;font-size:12px;cursor:pointer;font-family:inherit}
 .bnd15-mi:hover{background:rgba(56,189,248,.16)}
@@ -3318,6 +3419,16 @@ table.coord td:first-child{width:52px}
         ${item('xWkt', 'WKT', 'POLYGON / MULTIPOLYGON')}
         ${item('xArea', 'Area report CSV', 'Digitized against recorded area, per parcel')}
         ${item('gcpExport', 'Control points (.points)', 'QGIS-compatible')}
+        <div class="mcrs">
+          <label for="expCrs">Write coordinates in</label>
+          <select id="expCrs">
+            <option value="">This session — ${esc(Crs.describeCrs(sessionCrs()) || 'not set')}</option>
+            <option value="4326" ${S.exportCrsEpsg === '4326' ? 'selected' : ''}>Longitude / latitude (WGS 84)</option>
+            <option value="3857" ${S.exportCrsEpsg === '3857' ? 'selected' : ''}>Web Mercator</option>
+            ${[42, 43, 44, 45, 46, 47].map((z) => `<option value="${32600 + z}" ${S.exportCrsEpsg === String(32600 + z) ? 'selected' : ''}>UTM ${z}N (metres)</option>`).join('')}
+          </select>
+          ${exportConversionPlan() ? `<div class="${exportConversionPlan().exact ? 'dim' : 'warn'}">${exportConversionPlan().exact ? '↻ Converted on export.' : '⚠️ ' + esc(exportConversionPlan().message)}</div>` : ''}
+        </div>
         <div class="mn">Exports carry the corrected geometry — if a parcel has been shifted or transformed, that is what is written.</div>
       </div>
     </div>`;
@@ -3393,6 +3504,50 @@ table.coord td:first-child{width:52px}
     </details>`;
   }
 
+  /* Name the coordinate system of an import that declares none (brief §2:
+   * "If CRS cannot reliably be determined, ask the user instead of silently
+   * guessing"). The file is already parsed and held, so confirming here
+   * finishes the import rather than restarting it. */
+  function crsAskHtml() {
+    const a = st.crsAsk;
+    if (!a) return '';
+    const n = a.result.rings.length;
+    return `<div class="card" id="crsAsk">
+      <h4>Which coordinate system is this file in?</h4>
+      <div class="dim">${n} parcel(s) were read from ${esc(a.opts.what || 'the file')}${a.opts.name ? ` (${esc(a.opts.name)})` : ''}, but neither the file nor this session says what system the numbers are in. A wrong choice puts them hundreds of kilometres out, so it is asked rather than guessed.</div>
+      <div class="field" style="margin-top:6px"><span>Coordinates are in</span>
+        <select id="crsAskPick">
+          <option value="">— choose —</option>
+          <option value="4326" ${a.epsg === '4326' ? 'selected' : ''}>Longitude / latitude (WGS 84)</option>
+          <option value="3857" ${a.epsg === '3857' ? 'selected' : ''}>Web Mercator</option>
+          ${[42, 43, 44, 45, 46, 47].map((z) => `<option value="${32600 + z}" ${a.epsg === String(32600 + z) ? 'selected' : ''}>UTM ${z}N (metres)</option>`).join('')}
+        </select></div>
+      <div class="dim" style="font-size:10.5px">A hint from the numbers themselves: ${esc(describeImportMagnitude(a.result))}</div>
+      <div class="bnd15-row" style="margin-top:6px">
+        <button class="bnd15-btn sm green" id="crsAskGo" ${a.epsg ? '' : 'disabled'}>Import with this system</button>
+        <button class="bnd15-btn sm gray" id="crsAskCancel">Cancel</button>
+      </div>
+    </div>`;
+  }
+
+  /* The one thing that CAN be read from bare numbers: the family. Magnitudes
+   * for geographic, Web Mercator and projected grids are disjoint, so saying
+   * which family they look like narrows sixty candidates without inventing a
+   * zone — exactly the split lib/crs.js already makes. */
+  function describeImportMagnitude(result) {
+    const pts = [];
+    for (const r of result.rings) for (const p of r.points) pts.push(p);
+    if (!pts.length) return 'no coordinates to judge from.';
+    const fam = safe(() => Crs.classifyFamily(pts.slice(0, 200)), null);
+    const maxX = Math.max(...pts.map((p) => Math.abs(p[0])));
+    const maxY = Math.max(...pts.map((p) => Math.abs(p[1])));
+    const range = `values reach ${maxX.toFixed(0)}, ${maxY.toFixed(0)}`;
+    if (!fam || !fam.family) return `${range} — no family could be read from them.`;
+    if (fam.family === 'geographic') return `${range}, which is the degree range — these look like longitude/latitude.`;
+    if (fam.family === 'webmercator') return `${range}, which is the Web Mercator range.`;
+    return `${range}, which is a projected grid such as UTM — but the numbers cannot say WHICH zone, so that must come from you.`;
+  }
+
   function importSummaryHtml() {
     const s = st.importSummary;
     if (!s) return '';
@@ -3401,6 +3556,9 @@ table.coord td:first-child{width:52px}
       <div class="dim" style="font-size:10.5px;margin-top:3px">
         Layers: ${esc(s.layers.join(', ') || 'none')} · ${s.withPlotNo} with a plot number · ${esc(s.crsLabel)}${s.adoptedCrs ? ' <b class="warn">(taken from the file — check it)</b>' : ''}
       </div>
+      ${s.convertedFrom ? `<div class="${s.conversionExact ? 'dim' : 'warn'}" style="font-size:10.5px;margin-top:3px">
+        ${s.conversionExact ? '↻' : '⚠️'} Converted from <b>${esc(s.convertedFrom)}</b> to <b>${esc(s.crsLabel)}</b>${s.conversionExact ? ' — exact, same datum.' : `. ${esc(s.conversionNote || '')}`}
+      </div>` : ''}
       ${s.skipped.length ? `<details style="margin-top:4px"><summary class="dim" style="cursor:pointer">${s.skipped.length} item(s) skipped</summary>
         <ul class="dim" style="margin:4px 0 0;padding-left:16px;font-size:10.5px">${s.skipped.map((k) => `<li>${esc(k.what)} — ${esc(k.why)}</li>`).join('')}</ul></details>` : ''}
     </div>`;
@@ -3714,6 +3872,7 @@ table.coord td:first-child{width:52px}
       <div class="status">${esc(statusLine())}</div>
       ${mainBarHtml()}
       ${importSummaryHtml()}
+      ${crsAskHtml()}
       ${csvDialogHtml()}
       ${historyBarHtml()}
       ${workflowHtml()}
@@ -4053,6 +4212,14 @@ table.coord td:first-child{width:52px}
         renderWidget();
       });
     }
+    on('expCrs', 'onchange', (e) => {
+      S.exportCrsEpsg = e.target.value || '';
+      saveSettings();
+      renderWidget();
+      const plan = exportConversionPlan();
+      if (!plan) toast('Exports will be written in this session\u2019s own coordinate system.', 'info', 4000);
+      else toast(plan.message, plan.exact ? 'ok' : 'warn', plan.exact ? 5000 : 12000);
+    });
     on('xKml', 'onclick', () => { if (requireShapes()) EXPORTS.kml(); });
     on('xProj', 'onclick', () => {
       const name = prompt('Project name (also saved in this browser):', st.projectName || 'project-1');
@@ -4136,6 +4303,32 @@ table.coord td:first-child{width:52px}
         st.crsDetection = { crs, confidence: 1, needsConfirmation: false, reasons: ['Chosen during CSV import.'], candidates: [] };
       }
       toast(`Coordinate system set to ${Crs.describeCrs(crs)} for this import.`, 'info', 5000);
+    });
+    on('crsAskPick', 'onchange', (e) => { if (st.crsAsk) { st.crsAsk.epsg = e.target.value; renderWidget(); } });
+    on('crsAskGo', 'onclick', () => {
+      const a = st.crsAsk;
+      if (!a || !a.epsg) return toastErr('Choose a coordinate system first.');
+      const crs = safe(() => Crs.parseEpsg(a.epsg), null);
+      if (!crs) return toastErr('That EPSG code is not one this build knows.');
+      // Adopting it as the session's system is what makes the held import
+      // resolvable: the file now has a declared CRS and so does the session.
+      if (isWorkspace()) st.georefCrs = crs;
+      else {
+        st.crs = crs;
+        st.crsDetection = {
+          crs, confidence: 1, needsConfirmation: false,
+          reasons: [`Named by the operator while importing ${a.opts.what || 'a file'}.`],
+          candidates: [],
+        };
+      }
+      const held = a;
+      st.crsAsk = null;
+      adoptImportedRings(held.result, held.opts);
+    });
+    on('crsAskCancel', 'onclick', () => {
+      st.crsAsk = null;
+      renderWidget();
+      toast('Import cancelled — nothing was read.', 'info', 3000);
     });
     on('csvImport', 'onclick', confirmCsvImport);
     on('csvCancel', 'onclick', () => { st.csvDialog = null; renderWidget(); toast('Import cancelled — nothing was read.', 'info', 2500); });
