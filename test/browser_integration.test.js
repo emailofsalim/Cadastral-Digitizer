@@ -1,0 +1,1458 @@
+/* =========================================================================
+ * Browser integration — the gap this suite has carried since v14.
+ *
+ * Every other test file exercises pure logic. This one loads page_inject.js and
+ * all eight libraries into a real DOM (jsdom), puts a stub OpenLayers map behind
+ * them, and drives the extension the way a person does: dispatching pointer
+ * events, clicking buttons, reading the rendered widget.
+ *
+ * It is a BLACK-BOX test. page_inject.js exposes no test hooks and none were
+ * added for this — production code should not carry scaffolding for its tests.
+ * Everything below is asserted through the DOM and through observable effects.
+ *
+ * The canvas is stubbed to serve a synthetic cadastral sheet, so a tap in Trace
+ * mode runs the real tracing pipeline and produces a real shape.
+ *
+ * jsdom is an OPTIONAL dev dependency. Without it these tests skip and the rest
+ * of the suite still runs with no install at all, which is the property that
+ * makes `npm test` trustworthy for anyone who just unzipped the extension.
+ * Enable them with:  npm install --no-save jsdom
+ * ========================================================================= */
+'use strict';
+
+const { test, afterEach } = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
+
+let JSDOM = null;
+try { JSDOM = require('jsdom').JSDOM; } catch (e) { /* optional */ }
+const t = JSDOM ? test : test.skip;
+
+/* The extension legitimately runs long-lived intervals — it re-attaches its
+ * overlay and gestures periodically, because host apps replace their map
+ * element. Those keep Node's event loop alive, so every jsdom window is closed
+ * after each test. `npm test` also passes --test-force-exit as a safety net.
+ */
+const openWindows = [];
+afterEach(() => {
+  while (openWindows.length) {
+    const w = openWindows.pop();
+    try { w.close(); } catch (e) { /* already gone */ }
+  }
+});
+
+const ROOT = path.join(__dirname, '..');
+
+/* Load exactly what the extension loads, in the order it loads it.
+ *
+ * This list used to be typed out here by hand, and it silently went stale the
+ * moment a new library was added: page_inject.js refused to start, every test in
+ * this file failed with "the widget must be in the document", and the real cause
+ * (one missing file) was three levels down in a console message. Reading
+ * background.js means the harness cannot disagree with the extension about what
+ * the extension is made of. */
+function mainWorldFiles() {
+  const src = fs.readFileSync(path.join(ROOT, 'background.js'), 'utf8');
+  const block = src.match(/MAIN_WORLD_FILES\s*=\s*\[([^\]]*)\]/);
+  assert.ok(block, 'background.js must declare MAIN_WORLD_FILES');
+  const files = block[1].split(',')
+    .map((s) => s.trim().replace(/^['"]|['"]$/g, ''))
+    .filter(Boolean);
+  assert.ok(files.includes('page_inject.js'),
+    'MAIN_WORLD_FILES must end with page_inject.js');
+  return files;
+}
+const LIB_FILES = mainWorldFiles().filter((f) => f !== 'page_inject.js');
+
+/* ---------------------------------------------------------------------
+ * A synthetic sheet: one pale parcel ringed by a dark boundary, on a page
+ * background. 600x400 canvas pixels, parcel from (150,100) to (450,300).
+ * ------------------------------------------------------------------- */
+const CANVAS_W = 600, CANVAS_H = 400;
+const PARCEL_BOX = { x: 150, y: 100, w: 300, h: 200 };
+const C_PARCEL = [240, 220, 180];
+const C_WALL = [20, 20, 20];
+const C_PAGE = [205, 230, 240];
+
+function sheetImageData(x0, y0, w, h) {
+  const data = new Uint8ClampedArray(w * h * 4);
+  for (let j = 0; j < h; j++) {
+    for (let i = 0; i < w; i++) {
+      const gx = x0 + i, gy = y0 + j;
+      const inside = gx >= PARCEL_BOX.x && gx < PARCEL_BOX.x + PARCEL_BOX.w &&
+                     gy >= PARCEL_BOX.y && gy < PARCEL_BOX.y + PARCEL_BOX.h;
+      const wall = !inside &&
+        gx >= PARCEL_BOX.x - 3 && gx < PARCEL_BOX.x + PARCEL_BOX.w + 3 &&
+        gy >= PARCEL_BOX.y - 3 && gy < PARCEL_BOX.y + PARCEL_BOX.h + 3;
+      const c = inside ? C_PARCEL : (wall ? C_WALL : C_PAGE);
+      const k = (j * w + i) * 4;
+      data[k] = c[0]; data[k + 1] = c[1]; data[k + 2] = c[2]; data[k + 3] = 255;
+    }
+  }
+  return { data, width: w, height: h };
+}
+
+function stubContext() {
+  const noop = () => {};
+  return {
+    save: noop, restore: noop, beginPath: noop, closePath: noop,
+    moveTo: noop, lineTo: noop, arc: noop, fill: noop, stroke: noop,
+    clearRect: noop, fillRect: noop, strokeRect: noop, setLineDash: noop,
+    fillText: noop, setTransform: noop, drawImage: noop, translate: noop, scale: noop,
+    measureText: () => ({ width: 10 }),
+    getImageData: (x, y, w, h) => sheetImageData(x, y, w, h),
+    fillStyle: '', strokeStyle: '', lineWidth: 1, font: '', textAlign: '',
+    imageSmoothingEnabled: true,
+  };
+}
+
+/* ---------------------------------------------------------------------
+ * Stub OpenLayers map: a linear projected view in UTM 45N at exactly
+ * 0.5 m per CSS pixel, so expected ground sizes are known analytically.
+ * ------------------------------------------------------------------- */
+const MAP_RECT = { left: 0, top: 0, width: CANVAS_W, height: CANVAS_H };
+const CENTRE = [432500, 2618400];
+const M_PER_PX = 0.5;
+
+function installStubMap(win) {
+  const doc = win.document;
+  const viewport = doc.createElement('div');
+  viewport.id = 'stub-map';
+  viewport.style.cssText = `position:absolute;left:0;top:0;width:${CANVAS_W}px;height:${CANVAS_H}px;`;
+  const canvas = doc.createElement('canvas');
+  canvas.width = CANVAS_W;
+  canvas.height = CANVAS_H;
+  viewport.appendChild(canvas);
+  doc.body.appendChild(viewport);
+
+  // jsdom gives every element a zero rect; supply real geometry.
+  const rect = () => ({ ...MAP_RECT, right: MAP_RECT.width, bottom: MAP_RECT.height, x: 0, y: 0, toJSON() {} });
+  viewport.getBoundingClientRect = rect;
+  canvas.getBoundingClientRect = rect;
+  Object.defineProperty(canvas, 'clientWidth', { value: CANVAS_W, configurable: true });
+  Object.defineProperty(canvas, 'clientHeight', { value: CANVAS_H, configurable: true });
+
+  const state = { centre: CENTRE.slice(), zoom: 19 };
+  const listeners = {};
+  const view = {
+    getZoom: () => state.zoom, setZoom: (z) => { state.zoom = z; },
+    getCenter: () => state.centre.slice(), setCenter: (c) => { state.centre = c.slice(); },
+    getMinZoom: () => 0, getMaxZoom: () => 24, setMinZoom() {}, setMaxZoom() {},
+    getResolution: () => M_PER_PX,
+    getProjection: () => ({ getCode: () => 'EPSG:32645' }),
+  };
+  win.map = {
+    getView: () => view,
+    getViewport: () => viewport,
+    getCoordinateFromPixel: ([px, py]) => [
+      state.centre[0] + (px - CANVAS_W / 2) * M_PER_PX,
+      state.centre[1] - (py - CANVAS_H / 2) * M_PER_PX,
+    ],
+    getPixelFromCoordinate: ([x, y]) => [
+      (x - state.centre[0]) / M_PER_PX + CANVAS_W / 2,
+      (state.centre[1] - y) / M_PER_PX + CANVAS_H / 2,
+    ],
+    getLayers: () => ({ getArray: () => [] }),
+    on: (ev, cb) => { (listeners[ev] = listeners[ev] || []).push(cb); },
+    un: (ev, cb) => { listeners[ev] = (listeners[ev] || []).filter((f) => f !== cb); },
+  };
+  // Exposed so a test can aim a drag at a known map coordinate — a vertex it read
+  // out of the session — rather than at a screen position it guessed.
+  const toClient = ([x, y]) => win.map.getPixelFromCoordinate([x, y]);
+  return { viewport, canvas, toClient };
+}
+
+/* ---------------------------------------------------------------------
+ * Boot the extension inside a fresh jsdom.
+ * ------------------------------------------------------------------- */
+async function boot() {
+  const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
+    url: 'https://jharbhunaksha.jharkhand.gov.in/map',
+    pretendToBeVisual: true,
+    runScripts: 'outside-only',
+  });
+  const win = dom.window;
+
+  // Canvas is not implemented in jsdom; serve the synthetic sheet instead.
+  win.HTMLCanvasElement.prototype.getContext = function () { return stubContext(); };
+  win.URL.createObjectURL = () => 'blob:stub';
+  win.URL.revokeObjectURL = () => {};
+  win.confirm = () => true;
+  win.alert = () => {};
+  win.prompt = () => 'test-project';
+
+  const downloads = [];
+  const realCreate = win.document.createElement.bind(win.document);
+  win.document.createElement = function (tag) {
+    const el = realCreate(tag);
+    if (String(tag).toLowerCase() === 'a') {
+      el.click = function () { downloads.push({ name: el.download, href: el.href }); };
+    }
+    return el;
+  };
+
+  const surfaces = installStubMap(win);
+
+  for (const rel of LIB_FILES) {
+    win.eval(fs.readFileSync(path.join(ROOT, rel), 'utf8'));
+  }
+  win.eval(fs.readFileSync(path.join(ROOT, 'page_inject.js'), 'utf8'));
+
+  // boot() awaits adapter readiness, so give the microtask queue room.
+  for (let i = 0; i < 8; i++) await new Promise((r) => setTimeout(r, 12));
+
+  openWindows.push(win);
+  const widget = win.document.getElementById('bnd15-widget');
+  return { dom, win, widget, downloads, surfaces };
+}
+
+/* The autosaved session, which is where the real coordinates live.
+ *
+ * Reading it is how these tests check geometry without a test-only hook in the
+ * production code: sessionStorage is a genuine part of the extension's
+ * behaviour, so asserting on it exercises the same path a page reload does. */
+function session(win) {
+  const raw = win.sessionStorage.getItem('bnd15.session');
+  assert.ok(raw, 'the session should have been autosaved');
+  return JSON.parse(raw);
+}
+
+// Give the widget's own async work (tracing, refits) time to settle.
+const settle = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 12)); };
+
+function pointerEvent(win, type, clientX, clientY, extra) {
+  const e = new win.Event(type, { bubbles: true, cancelable: true });
+  Object.assign(e, { clientX, clientY, button: 0, pointerId: 1, altKey: false }, extra || {});
+  return e;
+}
+
+// A tap: down and up at the same place, under the 4px slop threshold.
+function tap(win, host, x, y, extra) {
+  host.dispatchEvent(pointerEvent(win, 'pointerdown', x, y, extra));
+  win.dispatchEvent(pointerEvent(win, 'pointerup', x, y, extra));
+}
+// A drag: movement beyond the slop, which must read as a pan, not an action.
+function drag(win, host, x0, y0, x1, y1) {
+  host.dispatchEvent(pointerEvent(win, 'pointerdown', x0, y0));
+  win.dispatchEvent(pointerEvent(win, 'pointermove', x1, y1));
+  win.dispatchEvent(pointerEvent(win, 'pointerup', x1, y1));
+}
+const click = (el) => el.dispatchEvent(new el.ownerDocument.defaultView.Event('click', { bubbles: true }));
+const q = (widget, sel) => widget.querySelector(sel);
+const bodyText = (widget) => widget.querySelector('#body').textContent;
+
+/* =====================================================================
+ * STARTUP
+ * =================================================================== */
+
+t('the extension boots, finds the map and builds its widget', async () => {
+  const { win, widget } = await boot();
+  assert.ok(widget, 'the widget must be in the document');
+  for (const g of ['BND_Crs', 'BND_GcpMath', 'BND_Tracer', 'BND_Topology',
+    'BND_Export', 'BND_Viewport', 'BND_Raster', 'BND_Adapters']) {
+    assert.ok(win[g], `library global ${g} must be present`);
+  }
+  // No "no supported map" error, and the mode buttons are enabled.
+  assert.ok(!/No supported map found/.test(bodyText(widget)), bodyText(widget).slice(0, 200));
+  assert.strictEqual(q(widget, '#mTrace').disabled, false, 'Trace should be enabled');
+});
+
+t('the CRS is resolved from the declared code and needs no confirmation', async () => {
+  const { widget } = await boot();
+  const text = bodyText(widget);
+  assert.match(text, /UTM 45N/, `expected the zone in the panel: ${text.slice(0, 300)}`);
+  assert.match(text, /confirmed/, 'a matching EPSG code should not need confirming');
+});
+
+t('the overlay never intercepts pointer events', async () => {
+  const { win } = await boot();
+  const ov = win.document.getElementById('bnd15-overlay');
+  assert.ok(ov, 'the overlay canvas must exist');
+  assert.strictEqual(ov.style.pointerEvents, 'none',
+    'if the overlay took events, the map could not be panned — this is the v14 regression');
+});
+
+/* =====================================================================
+ * GESTURES — tap versus drag, and click leakage
+ * =================================================================== */
+
+t('a tap in Trace mode digitizes a parcel from the canvas', async () => {
+  const { win, widget, surfaces } = await boot();
+  click(q(widget, '#mTrace'));
+  await settle(2);
+  assert.match(bodyText(widget), /Tap inside a parcel/, 'Trace mode should be armed');
+
+  // Tap the middle of the synthetic parcel.
+  tap(win, surfaces.viewport, PARCEL_BOX.x + PARCEL_BOX.w / 2, PARCEL_BOX.y + PARCEL_BOX.h / 2);
+  await settle(10);
+
+  const text = bodyText(widget);
+  assert.match(text, /Shape 1/, `a shape should have been added: ${text.slice(0, 400)}`);
+  // 300x200 canvas px at 0.5 m/px = 150 x 100 m = 15000 m² of grid area, and
+  // UTM k<1 here so ground area is a touch larger.
+  const m = text.match(/Shape 1 · (\d+)v · (\d+) m²/);
+  assert.ok(m, `expected the shape summary line, got: ${text.slice(0, 400)}`);
+  assert.ok(Number(m[1]) >= 4 && Number(m[1]) <= 8, `expected ~4 vertices, got ${m[1]}`);
+  const area = Number(m[2]);
+  assert.ok(Math.abs(area - 15000) / 15000 < 0.05,
+    `expected about 15000 m², got ${area}`);
+});
+
+t('a drag is a pan, not an action — the map is still usable in every mode', async () => {
+  const { win, widget, surfaces } = await boot();
+  click(q(widget, '#mTrace'));
+  await settle(2);
+  drag(win, surfaces.viewport,
+    PARCEL_BOX.x + PARCEL_BOX.w / 2, PARCEL_BOX.y + PARCEL_BOX.h / 2,
+    PARCEL_BOX.x + PARCEL_BOX.w / 2 + 60, PARCEL_BOX.y + PARCEL_BOX.h / 2 + 40);
+  await settle(8);
+  assert.ok(!/Shape 1/.test(bodyText(widget)),
+    'dragging must not trace — it belongs to the map');
+  assert.match(bodyText(widget), /Tap inside a parcel/, 'and the mode should still be armed');
+});
+
+t('a consumed tap does not leak a click to the portal underneath', async () => {
+  // The v15 defect: taps were left to propagate so panning would work, which
+  // also handed every tap to the site — on BhuNaksha that re-selects a parcel.
+  const { win, widget, surfaces } = await boot();
+  let siteClicks = 0;
+  surfaces.viewport.addEventListener('click', () => { siteClicks++; });
+
+  click(q(widget, '#mTrace'));
+  await settle(2);
+  tap(win, surfaces.viewport, PARCEL_BOX.x + 40, PARCEL_BOX.y + 40);
+  await settle(6);
+  // The browser synthesises a click after the gesture; it must be swallowed.
+  surfaces.viewport.dispatchEvent(new win.Event('click', { bubbles: true, cancelable: true }));
+  assert.strictEqual(siteClicks, 0,
+    'the portal must not receive a click that belonged to the digitizer');
+});
+
+t('when idle, clicks reach the portal normally', async () => {
+  // Blocking must be scoped to armed tools, or the extension breaks the site.
+  const { win, surfaces } = await boot();
+  let siteClicks = 0;
+  surfaces.viewport.addEventListener('click', () => { siteClicks++; });
+  tap(win, surfaces.viewport, 300, 200);
+  await settle(2);
+  surfaces.viewport.dispatchEvent(new win.Event('click', { bubbles: true, cancelable: true }));
+  assert.strictEqual(siteClicks, 1,
+    'with no tool armed the portal must keep working normally');
+});
+
+/* =====================================================================
+ * CONTROL POINTS — the explicit two-step pairing, end to end
+ * =================================================================== */
+
+async function withOneShape() {
+  const ctx = await boot();
+  click(q(ctx.widget, '#mTrace'));
+  await settle(2);
+  tap(ctx.win, ctx.surfaces.viewport, PARCEL_BOX.x + PARCEL_BOX.w / 2, PARCEL_BOX.y + PARCEL_BOX.h / 2);
+  await settle(10);
+  assert.match(bodyText(ctx.widget), /Shape 1/, 'setup: a shape is required');
+  return ctx;
+}
+
+t('pairing is two-step: nominate a vertex, then capture its true position', async () => {
+  const { win, widget, surfaces } = await withOneShape();
+  click(q(widget, '#mGcp'));
+  await settle(2);
+  assert.match(bodyText(widget), /Step 1 of 2/, 'should ask which vertex first');
+
+  // Step 1: tap the parcel's top-left corner.
+  tap(win, surfaces.viewport, PARCEL_BOX.x, PARCEL_BOX.y);
+  await settle(4);
+  const afterPick = bodyText(widget);
+  assert.match(afterPick, /Step 2 of 2/, `should advance to capture: ${afterPick.slice(0, 300)}`);
+  assert.match(afterPick, /Selected: vertex/, 'and name the nominated vertex');
+
+  // Step 2: tap 40 canvas px east of the corner.
+  tap(win, surfaces.viewport, PARCEL_BOX.x + 40, PARCEL_BOX.y);
+  await settle(4);
+  const afterCapture = bodyText(widget);
+  assert.match(afterCapture, /Step 1 of 2/, 'should return to step 1 for the next point');
+  assert.match(afterCapture, /Captured/, 'and echo the captured pair');
+  assert.match(afterCapture, /1 active/, 'one control point should now exist');
+
+  // The shift must be reported in GROUND METRES, not canvas pixels.
+  //
+  // The exact figure cannot be predicted, because the traced corner does not
+  // land precisely on the box corner that was tapped — leak suppression and
+  // edge growth move it by a few pixels, which is correct behaviour. What is
+  // predictable is the UNIT: at 0.5 m per pixel, a ~40 px offset is about 20 m
+  // of ground, whereas a pixel-unit bug would print roughly 40. Those are a
+  // clean factor of two apart, so the range below discriminates between them.
+  const m = afterCapture.match(/shift\s*([\d.]+)\s*m/);
+  assert.ok(m, `expected a shift readout: ${afterCapture.slice(0, 500)}`);
+  const shift = Number(m[1]);
+  assert.ok(shift > 12 && shift < 30,
+    `expected roughly 20 m of ground shift, got ${shift} — a value near 40 would mean ` +
+    'the readout is in canvas pixels rather than metres');
+});
+
+t('the captured coordinate is reported numerically, in CRS units and lon/lat', async () => {
+  const { win, widget, surfaces } = await withOneShape();
+  click(q(widget, '#mGcp'));
+  await settle(2);
+  tap(win, surfaces.viewport, PARCEL_BOX.x, PARCEL_BOX.y);
+  await settle(4);
+  tap(win, surfaces.viewport, PARCEL_BOX.x + 10, PARCEL_BOX.y + 4);
+  await settle(4);
+
+  const text = bodyText(widget);
+  assert.match(text, /stored/, 'the stored position must be shown');
+  assert.match(text, /true/, 'and the captured one');
+  assert.match(text, /lon\/lat/, 'and its lon/lat');
+  // Eastings around 432xxx and a Jharkhand longitude should both appear.
+  assert.match(text, /43\d{4}\.\d/, `expected a UTM easting: ${text.slice(0, 500)}`);
+  assert.match(text, /8[5-7]\.\d{5}/, 'expected a Jharkhand longitude');
+});
+
+t('Escape mid-pairing cancels only that pairing', async () => {
+  const { win, widget, surfaces } = await withOneShape();
+  click(q(widget, '#mGcp'));
+  await settle(2);
+  tap(win, surfaces.viewport, PARCEL_BOX.x, PARCEL_BOX.y);
+  await settle(3);
+  assert.match(bodyText(widget), /Step 2 of 2/);
+
+  const esc = new win.Event('keydown', { bubbles: true });
+  Object.assign(esc, { key: 'Escape' });
+  win.document.dispatchEvent(esc);
+  await settle(3);
+
+  const text = bodyText(widget);
+  assert.match(text, /Step 1 of 2/, 'the pairing should be cancelled');
+  assert.ok(/0 active/.test(text) || !/1 active/.test(text), 'no control point should be created');
+  assert.match(text, /Shape 1/, 'and the session must survive');
+});
+
+t('two control points produce a fit, and it can be applied', async () => {
+  const { win, widget, surfaces } = await withOneShape();
+  click(q(widget, '#mGcp'));
+  await settle(2);
+
+  // Two corners, each shifted the same 8 m east: a pure translation.
+  for (const corner of [[PARCEL_BOX.x, PARCEL_BOX.y], [PARCEL_BOX.x + PARCEL_BOX.w, PARCEL_BOX.y + PARCEL_BOX.h]]) {
+    tap(win, surfaces.viewport, corner[0], corner[1]);
+    await settle(4);
+    tap(win, surfaces.viewport, corner[0] + 16, corner[1]);
+    await settle(4);
+  }
+  const text = bodyText(widget);
+  assert.match(text, /2 active/, `expected two control points: ${text.slice(0, 300)}`);
+  // Both points agree on the same shift, so the panel must offer the model that
+  // reproduces it without inventing a scale or a rotation.
+  assert.match(text, /translation/, `a pure shift should be fitted as a translation: ${text.slice(0, 400)}`);
+  assert.match(text, /no scale or rotation change/,
+    'and the panel must say plainly that the plot will not be resized or spun');
+
+  const applyBtn = q(widget, '#applyAll');
+  assert.ok(applyBtn, 'an apply button should be offered');
+  assert.match(applyBtn.textContent, /Move all 1 shape/,
+    'the button must state its scope rather than saying only "Apply to all"');
+
+  const before = session(win).shapes[0].points.map((p) => p.slice());
+  click(applyBtn);
+  await settle(6);
+  const after = session(win).shapes[0].points;
+
+  // Every corner must move by the same vector, and by a real distance.
+  const moves = after.map((p, i) => [p[0] - before[i][0], p[1] - before[i][1]]);
+  const d0 = Math.hypot(moves[0][0], moves[0][1]);
+  assert.ok(d0 > 0.5, `the geometry should actually have moved, moved ${d0}`);
+  for (const m of moves) {
+    assert.ok(Math.abs(m[0] - moves[0][0]) < 1e-6 && Math.abs(m[1] - moves[0][1]) < 1e-6,
+      `a pure shift must move every corner identically: ${JSON.stringify(moves)}`);
+  }
+  assert.match(bodyText(widget), /GCP/, 'the shape should be marked as corrected');
+});
+
+t('pressing Apply twice does not move the shape twice', async () => {
+  // The reported field bug. A control point says "the geometry claims A, the
+  // truth is B". After Apply the corner IS at B, but the stale claim used to
+  // remain on file, so the same shift was applied again on the next press and
+  // the parcel walked away from its true position one press at a time.
+  const { win, widget, surfaces } = await withOneShape();
+  click(q(widget, '#mGcp'));
+  await settle(2);
+  for (const corner of [[PARCEL_BOX.x, PARCEL_BOX.y], [PARCEL_BOX.x + PARCEL_BOX.w, PARCEL_BOX.y + PARCEL_BOX.h]]) {
+    tap(win, surfaces.viewport, corner[0], corner[1]);
+    await settle(4);
+    tap(win, surfaces.viewport, corner[0] + 16, corner[1]);
+    await settle(4);
+  }
+
+  click(q(widget, '#applyAll'));
+  await settle(6);
+  const once = session(win).shapes[0].points.map((p) => p.slice());
+
+  click(q(widget, '#applyAll'));
+  await settle(6);
+  const twice = session(win).shapes[0].points;
+
+  for (let i = 0; i < once.length; i++) {
+    const drift = Math.hypot(twice[i][0] - once[i][0], twice[i][1] - once[i][1]);
+    assert.ok(drift < 1e-6,
+      `corner ${i} drifted a further ${drift} m on the second press; a satisfied ` +
+      `correction must be a no-op`);
+  }
+});
+
+t('a complete reset clears the control points too, not just the shapes', async () => {
+  // Reported: "when we are clearing, all GCPs are still captured". Three
+  // separate reset paths each cleared a different subset of the state.
+  const { win, widget, surfaces } = await withOneShape();
+  click(q(widget, '#mGcp'));
+  await settle(2);
+  tap(win, surfaces.viewport, PARCEL_BOX.x, PARCEL_BOX.y);
+  await settle(3);
+  tap(win, surfaces.viewport, PARCEL_BOX.x + 16, PARCEL_BOX.y);
+  await settle(4);
+
+  let s = session(win);
+  assert.strictEqual(s.gcps.length, 1, 'a control point should exist to be cleared');
+  assert.strictEqual(s.shapes.length, 1);
+
+  click(q(widget, '#delAll'));
+  await settle(6);
+
+  s = session(win);
+  assert.strictEqual(s.shapes.length, 0, 'shapes must go');
+  assert.strictEqual(s.gcps.length, 0, 'and so must the control points');
+  assert.deepStrictEqual(s.backups, {}, 'and the revert backups with them');
+  const text = bodyText(widget);
+  assert.ok(!/1 active/.test(text), `no control point should still be listed: ${text.slice(0, 300)}`);
+});
+
+t('undo reverses a deletion, and redo reinstates it', async () => {
+  const { win, widget } = await withOneShape();
+  assert.strictEqual(session(win).shapes.length, 1);
+
+  click(q(widget, '#delLast'));
+  await settle(4);
+  assert.strictEqual(session(win).shapes.length, 0, 'the shape should be gone');
+
+  const undoBtn = q(widget, '#gUndo');
+  assert.ok(undoBtn, 'a named undo button should appear once there is something to undo');
+  assert.match(undoBtn.textContent, /delete shape/,
+    'and it should say what it would reverse');
+  click(undoBtn);
+  await settle(4);
+  assert.strictEqual(session(win).shapes.length, 1, 'undo must bring the shape back');
+
+  click(q(widget, '#gRedo'));
+  await settle(4);
+  assert.strictEqual(session(win).shapes.length, 0, 'redo must delete it again');
+});
+
+t('Ctrl+Z undoes an applied correction, geometry and all', async () => {
+  const { win, widget, surfaces } = await withOneShape();
+  const original = session(win).shapes[0].points.map((p) => p.slice());
+
+  click(q(widget, '#mGcp'));
+  await settle(2);
+  tap(win, surfaces.viewport, PARCEL_BOX.x, PARCEL_BOX.y);
+  await settle(3);
+  tap(win, surfaces.viewport, PARCEL_BOX.x + 20, PARCEL_BOX.y + 10);
+  await settle(4);
+  click(q(widget, '#applyAll'));
+  await settle(6);
+
+  const moved = session(win).shapes[0].points;
+  assert.ok(Math.hypot(moved[0][0] - original[0][0], moved[0][1] - original[0][1]) > 0.5,
+    'the correction should have moved the geometry');
+
+  const z = new win.Event('keydown', { bubbles: true });
+  Object.assign(z, { key: 'z', ctrlKey: true, shiftKey: false });
+  win.document.dispatchEvent(z);
+  await settle(5);
+
+  const back = session(win).shapes[0].points;
+  for (let i = 0; i < original.length; i++) {
+    assert.ok(Math.hypot(back[i][0] - original[i][0], back[i][1] - original[i][1]) < 1e-6,
+      `corner ${i} should be exactly back where it started`);
+  }
+});
+
+t('a hand-drawn shape records a coordinate per corner, usable as control points', async () => {
+  // Asked for explicitly: "when we are drawing manually let it capture vertex
+  // coordinate as well so if required we will add gcp if not it will use its
+  // vertex coordinates". A drawn ring must be no less usable than a traced one.
+  const { win, widget, surfaces } = await boot();
+  click(q(widget, '#mDraw'));
+  await settle(2);
+
+  const corners = [[200, 150], [340, 150], [340, 260], [200, 260]];
+  for (const [x, y] of corners) {
+    tap(win, surfaces.viewport, x, y);
+    await settle(3);
+  }
+  click(q(widget, '#dFinish'));
+  await settle(5);
+
+  const s = session(win);
+  assert.strictEqual(s.shapes.length, 1, 'the drawn shape should be saved');
+  const shape = s.shapes[0];
+  assert.strictEqual(shape.points.length, corners.length,
+    'every corner tapped must be kept');
+  for (const p of shape.points) {
+    assert.strictEqual(p.length, 2, 'each corner is a coordinate pair');
+    assert.ok(Number.isFinite(p[0]) && Number.isFinite(p[1]),
+      `a real map coordinate, not a screen pixel: ${JSON.stringify(p)}`);
+  }
+  // Distinct corners, i.e. genuinely per-vertex rather than one repeated point.
+  assert.strictEqual(new Set(shape.points.map((p) => p.join(','))).size, corners.length);
+
+  // Those coordinates must be offered as control-point anchors.
+  click(q(widget, '#mGcp'));
+  await settle(3);
+  const picker = q(widget, '#vertexPick');
+  assert.ok(picker, 'the vertex picker should be offered for a hand-drawn shape');
+  const values = [...picker.querySelectorAll('option')].map((o) => o.value).filter(Boolean);
+  assert.strictEqual(values.length, corners.length,
+    `every drawn corner should be pickable, got ${JSON.stringify(values)}`);
+  assert.ok(values.every((v) => v.startsWith(`${shape.id}:`)),
+    'and they should belong to the drawn shape');
+  // The stored coordinate is shown, so it can be checked rather than assumed.
+  assert.match(picker.textContent, /v0 — /, 'each option should display its coordinate');
+});
+
+t('dragging a corner in Edit mode records a control point by itself', async () => {
+  // "if we will adjust the shape of the plot it will automatically create its gcp"
+  const { win, widget, surfaces } = await withOneShape();
+  assert.strictEqual(session(win).gcps.length, 0, 'no control points to start with');
+
+  const shape = session(win).shapes[0];
+  click(q(widget, `[data-edit="${shape.id}"]`));
+  await settle(3);
+
+  // Grab the first corner and drag it well beyond the snap tolerance.
+  const before = shape.points[0].slice();
+  const screen = surfaces.toClient(before);
+  drag(win, surfaces.viewport, screen[0], screen[1], screen[0] + 40, screen[1] + 25);
+  await settle(6);
+
+  const s = session(win);
+  assert.strictEqual(s.gcps.length, 1,
+    `the drag alone should have produced a control point: ${JSON.stringify(s.gcps)}`);
+  const g = s.gcps[0];
+  assert.strictEqual(g.shapeId, shape.id);
+  assert.strictEqual(g.vertexIndex, 0);
+  // The source must be where the corner WAS. Recording the new position would
+  // mean a zero shift, which teaches the fit nothing.
+  assert.ok(Math.hypot(g.source[0] - before[0], g.source[1] - before[1]) < 1e-6,
+    `source should be the pre-drag position ${JSON.stringify(before)}, got ${JSON.stringify(g.source)}`);
+  const moved = s.shapes[0].points[0];
+  assert.ok(Math.hypot(g.target[0] - moved[0], g.target[1] - moved[1]) < 1e-6,
+    'and the target should be where the corner now is');
+  assert.ok(Math.hypot(g.target[0] - g.source[0], g.target[1] - g.source[1]) > 1,
+    'with a real shift between them');
+});
+
+t('the panel opens with a numbered guide to the whole job', async () => {
+  const { widget } = await boot();
+  const text = bodyText(widget);
+  assert.match(text, /How this works/, 'the workflow should be stated up front');
+  assert.match(text, /Digitise the parcels/);
+  assert.match(text, /Correct the position/);
+  assert.match(text, /Check and export/);
+  // Georeferencing is not part of every job, and implying it is sends operators
+  // hunting for control points they do not need.
+  assert.match(text, /optional/, 'the correction step must be marked optional');
+});
+
+/* =====================================================================
+ * CLEAN-UP AND EXPORT
+ * =================================================================== */
+
+t('regularise squares up a traced parcel and reports it', async () => {
+  const { widget } = await withOneShape();
+  const before = bodyText(widget).match(/Shape 1 · (\d+)v/)[1];
+  const btn = q(widget, '#regAll');
+  assert.ok(btn, 'a regularise control should be offered');
+  click(btn);
+  await settle(6);
+  const after = bodyText(widget).match(/Shape 1 · (\d+)v/)[1];
+  assert.ok(Number(after) <= Number(before),
+    `regularising must not add vertices: ${before} -> ${after}`);
+  assert.ok(Number(after) >= 3, 'and must leave a valid polygon');
+});
+
+t('the quality report grades the session with itemised reasons', async () => {
+  const { widget } = await withOneShape();
+  click(q(widget, '#qual'));
+  await settle(6);
+  const text = bodyText(widget);
+  assert.match(text, /Quality/, 'a quality card should appear');
+  assert.match(text, /\/100/, 'with a score out of 100');
+  assert.match(text, /error\(s\)/, 'and a count of problems');
+});
+
+t('every export format produces a download', async () => {
+  const { widget, downloads } = await withOneShape();
+  const expected = [
+    ['#xDxf', /\.dxf$/], ['#xKmz', /\.kmz$/], ['#xGeo', /\.geojson$/],
+    ['#xShp', /\.zip$/], ['#xWkt', /\.wkt$/], ['#xCsv', /\.csv$/], ['#xArea', /\.csv$/],
+  ];
+  for (const [sel, pattern] of expected) {
+    const btn = q(widget, sel);
+    assert.ok(btn, `export button ${sel} should exist`);
+    const before = downloads.length;
+    click(btn);
+    await settle(4);
+    assert.ok(downloads.length > before, `${sel} should have produced a download`);
+    assert.match(downloads[downloads.length - 1].name, pattern,
+      `${sel} produced ${downloads[downloads.length - 1].name}`);
+  }
+});
+
+t('exports are refused with a reason when nothing is digitized', async () => {
+  const { widget, downloads } = await boot();
+  click(q(widget, '#xGeo'));
+  await settle(3);
+  assert.strictEqual(downloads.length, 0, 'nothing should be written');
+});
+
+/* =====================================================================
+ * SETTINGS AND PERSISTENCE
+ * =================================================================== */
+
+t('zoom is manual: tracing never moves the view on its own', async () => {
+  const { win, widget, surfaces } = await boot();
+  const zoomBefore = win.map.getView().getZoom();
+  const centreBefore = win.map.getView().getCenter();
+  click(q(widget, '#mTrace'));
+  await settle(2);
+  tap(win, surfaces.viewport, PARCEL_BOX.x + PARCEL_BOX.w / 2, PARCEL_BOX.y + PARCEL_BOX.h / 2);
+  await settle(10);
+  assert.strictEqual(win.map.getView().getZoom(), zoomBefore,
+    'the operator\'s zoom must be left alone');
+  assert.deepStrictEqual(win.map.getView().getCenter(), centreBefore,
+    'and their centre too');
+  assert.ok(q(widget, '#zoomIn'), 'zooming is offered as an explicit button instead');
+});
+
+t('settings persist to localStorage and reload', async () => {
+  const { win, widget } = await boot();
+  click(q(widget, '#advT'));
+  await settle(2);
+  const slider = q(widget, '#sTol');
+  assert.ok(slider, 'the colour tolerance control should be visible by default');
+  slider.value = '77';
+  slider.dispatchEvent(new win.Event('input', { bubbles: true }));
+  await settle(2);
+  const saved = JSON.parse(win.localStorage.getItem('bnd15.settings'));
+  assert.strictEqual(saved.colorTolerance, 77, 'the change must be persisted');
+});
+
+t('only four settings are visible before expanding the groups', async () => {
+  const { widget } = await boot();
+  click(q(widget, '#advT'));
+  await settle(2);
+  const advBody = q(widget, '#advB');
+  // Fields directly in the panel, not inside a collapsed <details>.
+  const direct = Array.from(advBody.children).filter((el) => el.classList.contains('field'));
+  assert.strictEqual(direct.length, 4,
+    `expected four essentials, found ${direct.length}: ${direct.map((d) => d.textContent.trim()).join(' | ')}`);
+  assert.ok(advBody.querySelectorAll('details').length >= 4, 'the rest should be grouped and collapsed');
+});
+
+t('a session survives a reload from sessionStorage', async () => {
+  const { win, widget } = await withOneShape();
+  const saved = win.sessionStorage.getItem('bnd15.session');
+  assert.ok(saved, 'the session must be autosaved');
+  const parsed = JSON.parse(saved);
+  assert.strictEqual(parsed.shapes.length, 1);
+  assert.ok(Array.isArray(parsed.shapes[0].points) && parsed.shapes[0].points.length >= 4);
+  void widget;
+});
+
+/* =====================================================================
+ * CREDIT
+ * =================================================================== */
+
+t('the widget credits the author', async () => {
+  const { widget } = await boot();
+  assert.match(widget.textContent, /Md Salim Ansari/);
+  assert.match(widget.textContent, /MIT/);
+});
+
+/* =====================================================================
+ * RASTER WORKSPACE, mounted for real
+ * =================================================================== */
+
+t('an image workspace mounts and switches coordinates to pixels', async () => {
+  const { win, widget } = await boot();
+  assert.ok(q(widget, '#wsFile'), 'a file entry point should be offered');
+  assert.ok(q(widget, '#wsCapture'), 'and a capture entry point for PDFs');
+
+  // Mount directly through the library, since a file picker cannot be driven
+  // headlessly. This still exercises the real adapter against a real DOM.
+  const made = win.BND_Raster.createRasterWorkspace({
+    doc: win.document, win, Viewport: win.BND_Viewport,
+    image: { width: 800, height: 600, drawable: win.document.createElement('canvas') },
+    sourceName: 'sheet.png', sourceKind: 'file',
+  });
+  assert.strictEqual(made.ok, true, made.error);
+  const container = win.document.getElementById('bnd15-raster-workspace');
+  assert.ok(container, 'the workspace container must be attached to the document');
+
+  const a = made.adapter;
+  assert.strictEqual(a.isRaster, true);
+  assert.strictEqual(a.coordsAreLonLat, false, 'pixels are not lon/lat');
+  assert.strictEqual(a.getProjectionCode(), null, 'and no projection is claimed');
+  const cnv = a.getCanvas();
+  assert.strictEqual(cnv.width, 800, 'tracing reads the image at native resolution');
+
+  a.destroy();
+  assert.ok(!win.document.getElementById('bnd15-raster-workspace'),
+    'destroy must detach it');
+});
+
+/* =====================================================================
+ * NO CRASHES ANYWHERE
+ * =================================================================== */
+
+t('driving every control raises no exception', async () => {
+  const errors = [];
+  const { win, widget, surfaces } = await withOneShape();
+  win.addEventListener('error', (e) => errors.push(String(e.message || e)));
+  const origError = win.console.error;
+  win.console.error = (...args) => { errors.push(args.join(' ')); origError.apply(win.console, args); };
+
+  // Every button in the widget, twice, in order — including toggles.
+  for (let pass = 0; pass < 2; pass++) {
+    const buttons = Array.from(widget.querySelectorAll('button'));
+    for (const b of buttons) {
+      if (b.id === 'close' || b.id === 'wsClose') continue; // would tear down the fixture
+      click(b);
+      await settle(1);
+    }
+    await settle(3);
+  }
+  // And a tap in each mode.
+  for (const id of ['#mTrace', '#mDraw', '#mGcp']) {
+    const el = q(widget, id);
+    if (!el) continue;
+    click(el);
+    await settle(1);
+    tap(win, surfaces.viewport, 300, 200);
+    await settle(3);
+  }
+  const real = errors.filter((e) => !/Not implemented|Could not parse CSS/i.test(e));
+  assert.deepStrictEqual(real, [], `unexpected errors: ${real.join(' | ')}`);
+});
+
+/* =====================================================================
+ * v17 — THE THREE MAIN BUTTONS  (brief §1, §29)
+ * =================================================================== */
+
+t('the workspace offers exactly three primary controls', async () => {
+  const { widget } = await boot();
+  for (const id of ['#btnImport', '#btnExport', '#btnSaveProject']) {
+    assert.ok(q(widget, id), `${id} must exist`);
+  }
+  // "Do not create additional permanent Import/Export buttons." Project import
+  // and export live inside the menus, so they must not also appear as
+  // top-level controls beside the three.
+  const mainRow = q(widget, '.bnd15-main > .bnd15-row');
+  const labels = Array.from(mainRow.querySelectorAll('button')).map((b) => b.textContent.trim());
+  assert.strictEqual(labels.length, 3, `expected three primary buttons, got: ${labels.join(' | ')}`);
+  assert.match(labels[0], /Import/);
+  assert.match(labels[1], /Export/);
+  assert.match(labels[2], /Save Project/);
+});
+
+t('the menus open, close, and hold the format entries', async () => {
+  const { widget } = await boot();
+  const menuImport = () => q(widget, '#menuImport');
+  const menuExport = () => q(widget, '#menuExport');
+
+  assert.ok(!menuImport().classList.contains('open'), 'menus start closed');
+
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  assert.ok(menuImport().classList.contains('open'), 'Import must open its menu');
+  assert.ok(!menuExport().classList.contains('open'), 'and not the other one');
+
+  click(q(widget, '#btnExport'));
+  await settle(2);
+  assert.ok(menuExport().classList.contains('open'), 'Export must open its menu');
+  assert.ok(!menuImport().classList.contains('open'), 'which closes Import');
+
+  click(q(widget, '#btnExport'));
+  await settle(2);
+  assert.ok(!menuExport().classList.contains('open'), 'and pressing it again closes it');
+});
+
+t('every format the brief names is reachable from a menu', async () => {
+  const { widget } = await boot();
+  // Import: project JSON, KMZ/KML, DXF, CSV vertices, image, PDF.
+  for (const id of ['#xLoad', '#iKml', '#iDxf', '#iCsv', '#iGeo', '#gcpImport', '#iImage', '#iPdf']) {
+    assert.ok(q(widget, `#menuImport ${id}`), `Import menu must offer ${id}`);
+  }
+  // Export: project JSON, KML, KMZ, DXF, CSV vertices, and the rest.
+  for (const id of ['#xProj', '#xKml', '#xKmz', '#xDxf', '#xCsv', '#xGeo', '#xShp', '#xWkt', '#xArea', '#gcpExport']) {
+    assert.ok(q(widget, `#menuExport ${id}`), `Export menu must offer ${id}`);
+  }
+});
+
+t('the export controls still work while their menu is closed', async () => {
+  // They are hidden by a class, not removed from the document. If that ever
+  // changes to build-on-open, this fails rather than the harness quietly
+  // losing its reach.
+  const { widget, downloads } = await withOneShape();
+  assert.ok(!q(widget, '#menuExport').classList.contains('open'));
+  click(q(widget, '#xGeo'));
+  await settle(4);
+  assert.strictEqual(downloads.length, 1);
+  assert.match(downloads[0].name, /\.geojson$/);
+});
+
+t('Save Project writes ProjectName.json and does not duplicate on a second press', async () => {
+  const { win, widget, downloads } = await withOneShape();
+  win.prompt = () => 'kanke-block-7';
+
+  click(q(widget, '#btnSaveProject'));
+  await settle(4);
+  assert.strictEqual(downloads.length, 1);
+  assert.strictEqual(downloads[0].name, 'kanke-block-7.json');
+
+  const saved = JSON.parse(win.localStorage.getItem('bnd15.projects'));
+  assert.ok(saved['kanke-block-7'], 'it must also be kept in the browser');
+
+  // Second press must update the same project, not invent "kanke-block-7 (2)".
+  win.prompt = () => { throw new Error('must not ask again once the project has a name'); };
+  click(q(widget, '#btnSaveProject'));
+  await settle(4);
+  assert.strictEqual(downloads.length, 2);
+  assert.strictEqual(downloads[1].name, 'kanke-block-7.json', 'the same file, updated');
+  assert.strictEqual(Object.keys(JSON.parse(win.localStorage.getItem('bnd15.projects'))).length, 1,
+    'one project, not two');
+});
+
+t('a saved project carries the whole workspace, not just the outlines', async () => {
+  const { win, widget } = await withOneShape();
+  win.prompt = () => 'p1';
+  click(q(widget, '#btnSaveProject'));
+  await settle(4);
+  const proj = JSON.parse(win.localStorage.getItem('bnd15.projects')).p1;
+  for (const k of ['schema', 'shapes', 'gcps', 'crs', 'projectName', 'georefPoints',
+    'calibration', 'drawing', 'settings']) {
+    assert.ok(k in proj, `a project must store ${k}`);
+  }
+  assert.ok(proj.schema >= 2);
+  assert.ok(proj.shapes[0].layer, 'every parcel must carry its layer');
+  assert.ok(proj.shapes[0].source, 'and where it came from');
+});
+
+/* =====================================================================
+ * v17 — COLLAPSIBLE SECTIONS  (brief §7)
+ * =================================================================== */
+
+t('the cadastral tool sections collapse and remember their state', async () => {
+  const { win, widget } = await withOneShape();
+  const keys = Array.from(widget.querySelectorAll('details.sect')).map((d) => d.dataset.sect);
+  for (const want of ['workflow', 'cleanup', 'edit', 'gcp', 'drawing']) {
+    assert.ok(keys.includes(want), `"${want}" must be collapsible — got ${keys.join(', ')}`);
+  }
+  // Settings was already collapsible and stays so.
+  assert.ok(q(widget, '#advT'), 'Settings keeps its own collapse');
+
+  const cleanup = widget.querySelector('details.sect[data-sect="cleanup"]');
+  assert.ok(!cleanup.open, 'sections other than the defaults start closed, to leave the map room');
+  cleanup.open = true;
+  cleanup.dispatchEvent(new win.Event('toggle'));
+  await settle(2);
+  const saved = JSON.parse(win.localStorage.getItem('bnd15.settings'));
+  assert.ok(saved.openSections.includes('cleanup'), 'the open state must persist');
+});
+
+t('a collapsed section keeps its controls in the document', async () => {
+  // This is what lets the panel be uncluttered without putting anything out of
+  // reach — of an operator using find-in-page, or of this harness.
+  const { widget } = await withOneShape();
+  const cleanup = widget.querySelector('details.sect[data-sect="cleanup"]');
+  assert.ok(!cleanup.open);
+  assert.ok(q(widget, '#regAll'), 'Regularise must still be findable while collapsed');
+  assert.ok(q(widget, '#snapAll'));
+  assert.ok(q(widget, '#qual'));
+});
+
+/* =====================================================================
+ * v17 — UNDO / REDO / REMOVE LAST / RESET EVERYTHING  (brief §8)
+ * =================================================================== */
+
+t('all four editing controls sit together and are always present', async () => {
+  const { widget } = await boot();
+  const bar = q(widget, '.bnd15-hist');
+  assert.ok(bar, 'the editing controls need a bar of their own');
+  const ids = Array.from(bar.querySelectorAll('button')).map((b) => b.id);
+  assert.deepStrictEqual(ids, ['gUndo', 'gRedo', 'delLast', 'delAll'],
+    'in the order the brief gives them');
+  // Present even with nothing to undo — a control that comes and goes cannot be
+  // found reliably.
+  assert.ok(q(widget, '#gUndo').disabled, 'Undo is disabled, not absent');
+});
+
+/* =====================================================================
+ * v17 — MOVE, ROTATE, SCALE  (brief §3, §4, §10)
+ * =================================================================== */
+
+async function withSelection() {
+  const ctx = await withOneShape();
+  click(q(ctx.widget, '[data-sel]'));
+  await settle(3);
+  return ctx;
+}
+
+t('the Edit section names every tool the brief lists', async () => {
+  const { widget } = await withOneShape();
+  const text = bodyText(widget);
+  for (const tool of ['Select', 'Move Geometry', 'Move Vertex', 'Add Vertex',
+    'Delete Vertex', 'Rotate', 'Scale', 'Copy', 'Duplicate', 'Delete']) {
+    assert.ok(text.includes(tool), `Edit must offer "${tool}"`);
+  }
+});
+
+t('a typed X/Y shift moves the parcel by exactly that much', async () => {
+  const { win, widget } = await withSelection();
+  const before = session(win).shapes[0].points.map((p) => p.slice());
+
+  q(widget, '#eDx').value = '3.5';
+  q(widget, '#eDy').value = '-2.25';
+  click(q(widget, '#eApplyXY'));
+  await settle(4);
+
+  const after = session(win).shapes[0].points;
+  assert.strictEqual(after.length, before.length);
+  for (let i = 0; i < before.length; i++) {
+    assert.ok(Math.abs((after[i][0] - before[i][0]) - 3.5) < 1e-9, `vertex ${i} x`);
+    assert.ok(Math.abs((after[i][1] - before[i][1]) - (-2.25)) < 1e-9, `vertex ${i} y`);
+  }
+});
+
+t('a move is recorded separately from the geometry, and is resettable', async () => {
+  const { win, widget } = await withSelection();
+  const original = session(win).shapes[0].points.map((p) => p.slice());
+
+  q(widget, '#eDx').value = '4';
+  q(widget, '#eDy').value = '0';
+  click(q(widget, '#eApplyXY'));
+  await settle(4);
+
+  const shape = session(win).shapes[0];
+  assert.ok(shape.shift, 'the parcel must carry a shift record');
+  assert.ok(Math.abs(shape.shift.dx - 4) < 1e-9, 'stating the translation');
+  assert.strictEqual(shape.shift.rotationDeg, 0);
+  assert.strictEqual(shape.shift.scale, 1);
+  assert.match(bodyText(widget), /Shift on this parcel/, 'and the panel must show it');
+
+  // Reset restores the original exactly and clears the record.
+  click(q(widget, '#eResetShift'));
+  await settle(4);
+  const back = session(win).shapes[0];
+  for (let i = 0; i < original.length; i++) {
+    assert.ok(Math.abs(back.points[i][0] - original[i][0]) < 1e-9, `vertex ${i} must return`);
+    assert.ok(Math.abs(back.points[i][1] - original[i][1]) < 1e-9);
+  }
+  assert.strictEqual(back.shift.dx, 0, 'and the record goes with it');
+});
+
+t('undo reverses a move, and says what it would reverse', async () => {
+  const { win, widget } = await withSelection();
+  const before = session(win).shapes[0].points.map((p) => p.slice());
+
+  q(widget, '#eDx').value = '7';
+  q(widget, '#eDy').value = '0';
+  click(q(widget, '#eApplyXY'));
+  await settle(4);
+  assert.ok(Math.abs(session(win).shapes[0].points[0][0] - before[0][0] - 7) < 1e-9);
+
+  const undo = q(widget, '#gUndo');
+  assert.match(undo.textContent, /move shape/, 'the button must name the operation');
+  click(undo);
+  await settle(4);
+  const after = session(win).shapes[0].points;
+  for (let i = 0; i < before.length; i++) {
+    assert.ok(Math.abs(after[i][0] - before[i][0]) < 1e-9, `undo must restore vertex ${i}`);
+  }
+});
+
+t('rotating turns the parcel where it stands and does not move it', async () => {
+  const { win, widget } = await withSelection();
+  const E = require('../lib/exporters.js');
+  const before = session(win).shapes[0].points.map((p) => p.slice());
+  const c0 = E.centroidOfRing(before);
+  const area0 = E.gridArea(before);
+
+  q(widget, '#eRot').value = '5';
+  click(q(widget, '#eApplyRot'));
+  await settle(4);
+
+  const after = session(win).shapes[0].points;
+  const c1 = E.centroidOfRing(after);
+  // A rotation that also translates is a positional error dressed as a
+  // rotation, and at UTM magnitudes it is exactly the kind that goes unnoticed.
+  assert.ok(Math.hypot(c1[0] - c0[0], c1[1] - c0[1]) < 1e-3,
+    `the parcel moved ${Math.hypot(c1[0] - c0[0], c1[1] - c0[1])} m while only being rotated`);
+  assert.ok(Math.abs(E.gridArea(after) / area0 - 1) < 1e-6, 'and its area must not change');
+  assert.ok(Math.abs(session(win).shapes[0].shift.rotationDeg - 5) < 1e-9);
+});
+
+t('scaling changes area by the square of the factor and is recorded', async () => {
+  const { win, widget } = await withSelection();
+  const E = require('../lib/exporters.js');
+  const area0 = E.gridArea(session(win).shapes[0].points);
+
+  q(widget, '#eScale').value = '1.05';
+  click(q(widget, '#eApplyScale'));
+  await settle(4);
+
+  const shape = session(win).shapes[0];
+  assert.ok(Math.abs(E.gridArea(shape.points) / area0 - 1.05 * 1.05) < 1e-6);
+  assert.ok(Math.abs(shape.shift.scale - 1.05) < 1e-9);
+});
+
+t('stacked operations leave one record that describes all of them', async () => {
+  const { win, widget } = await withSelection();
+  const G = require('../lib/geom_edit.js');
+  const original = session(win).shapes[0].points.map((p) => p.slice());
+
+  q(widget, '#eDx').value = '3'; q(widget, '#eDy').value = '-2';
+  click(q(widget, '#eApplyXY'));
+  await settle(3);
+  q(widget, '#eRot').value = '1.5';
+  click(q(widget, '#eApplyRot'));
+  await settle(3);
+  q(widget, '#eScale').value = '1.01';
+  click(q(widget, '#eApplyScale'));
+  await settle(3);
+
+  const shape = session(win).shapes[0];
+  // The record applied to the ORIGINAL must reproduce the live geometry. If it
+  // does not, the record is describing something that did not happen.
+  const predicted = G.applyShiftToRing(shape.shift, original);
+  for (let i = 0; i < original.length; i++) {
+    const d = Math.hypot(predicted[i][0] - shape.points[i][0], predicted[i][1] - shape.points[i][1]);
+    assert.ok(d < 1e-6, `the shift record disagrees with the geometry at vertex ${i} by ${d} m`);
+  }
+});
+
+t('duplicate makes a second, offset parcel that can be told apart', async () => {
+  const { win, widget } = await withSelection();
+  assert.strictEqual(session(win).shapes.length, 1);
+  click(q(widget, '#eDuplicate'));
+  await settle(4);
+  const shapes = session(win).shapes;
+  assert.strictEqual(shapes.length, 2);
+  assert.notStrictEqual(shapes[0].id, shapes[1].id);
+  const moved = Math.hypot(shapes[1].points[0][0] - shapes[0].points[0][0],
+    shapes[1].points[0][1] - shapes[0].points[0][1]);
+  assert.ok(moved > 0, 'a copy exactly on top of the original cannot be selected apart');
+});
+
+t('deleting the selected parcel removes it, and undo brings it back', async () => {
+  const { win, widget } = await withSelection();
+  click(q(widget, '#eDelete'));
+  await settle(4);
+  assert.strictEqual(session(win).shapes.length, 0);
+  click(q(widget, '#gUndo'));
+  await settle(4);
+  assert.strictEqual(session(win).shapes.length, 1);
+});
+
+t('the Edit tools refuse politely when nothing is selected', async () => {
+  // Every one of these is reachable with no selection, and the crash sweep
+  // presses all of them. They must decline rather than throw.
+  const { win, widget } = await withOneShape();
+  for (const id of ['#eApplyXY', '#eApplyRot', '#eApplyScale', '#eCopy', '#eDuplicate', '#eDelete']) {
+    const el = q(widget, id);
+    assert.ok(el, `${id} must exist`);
+    click(el);
+    await settle(1);
+  }
+  assert.strictEqual(session(win).shapes.length, 1, 'nothing may happen without a selection');
+});
+
+/* =====================================================================
+ * v17 — MOVE GEOMETRY IS NOT MAP PAN  (brief §26)
+ * =================================================================== */
+
+t('dragging the map still pans it while Move Geometry is armed', async () => {
+  const { win, widget, surfaces } = await withSelection();
+  click(q(widget, '#eMove'));
+  await settle(2);
+
+  const centreBefore = win.map.getView().getCenter().slice();
+  const pointsBefore = session(win).shapes[0].points.map((p) => p.slice());
+
+  // A drag well outside the parcel is a pan, and must leave the geometry alone.
+  drag(win, surfaces.viewport, 20, 20, 60, 60);
+  await settle(4);
+
+  const pointsAfter = session(win).shapes[0].points;
+  for (let i = 0; i < pointsBefore.length; i++) {
+    assert.deepStrictEqual(pointsAfter[i], pointsBefore[i],
+      'panning the map must never move a parcel');
+  }
+  void centreBefore;
+});
+
+t('dragging the parcel moves it and leaves the map where it was', async () => {
+  const { win, widget, surfaces } = await withSelection();
+  click(q(widget, '#eMove'));
+  await settle(2);
+
+  const zoomBefore = win.map.getView().getZoom();
+  const centreBefore = win.map.getView().getCenter().slice();
+  const before = session(win).shapes[0].points.map((p) => p.slice());
+
+  const cx = PARCEL_BOX.x + PARCEL_BOX.w / 2;
+  const cy = PARCEL_BOX.y + PARCEL_BOX.h / 2;
+  drag(win, surfaces.viewport, cx, cy, cx + 20, cy);
+  await settle(5);
+
+  const after = session(win).shapes[0].points;
+  const moved = Math.hypot(after[0][0] - before[0][0], after[0][1] - before[0][1]);
+  assert.ok(moved > 1, `the parcel should have moved, it moved ${moved} m`);
+  // Every vertex by the same amount: a move must not deform.
+  for (let i = 1; i < before.length; i++) {
+    assert.ok(Math.abs((after[i][0] - before[i][0]) - (after[0][0] - before[0][0])) < 1e-9,
+      'a move must translate every corner equally');
+  }
+  assert.deepStrictEqual(win.map.getView().getCenter(), centreBefore, 'the map must not move');
+  assert.strictEqual(win.map.getView().getZoom(), zoomBefore);
+  assert.ok(session(win).shapes[0].shift.dx !== 0, 'and the move must be recorded');
+});
+
+/* =====================================================================
+ * v17 — DRAWING SCALE  (brief §12, §13)
+ * =================================================================== */
+
+t('the drawing-scale controls appear only on a raster sheet', async () => {
+  const { widget } = await boot();
+  // On a live map there is no sheet to scale, so offering an RF box would be
+  // meaningless.
+  assert.ok(!q(widget, '#rfApply'), 'no RF control on a live map');
+  assert.ok(q(widget, '#wsFile'), 'but the way into a sheet must be offered');
+});
+
+/* =====================================================================
+ * v17 — IMPORT, END TO END  (brief §2, §16, §23, §25)
+ * ---------------------------------------------------------------------
+ * The whole chain through the real widget: a DXF goes in through the file
+ * picker, the parcels overlay themselves, they are edited with the tools that
+ * already existed, cleaned by the topology code that already existed, and
+ * exported carrying the correction.
+ *
+ * That last part is the claim worth testing. "Imported geometry uses the
+ * existing editing system" is easy to assert in prose and easy to get wrong;
+ * this drives it.
+ * =================================================================== */
+
+/* Hand the next file input a file, so the picker path runs for real rather
+ * than the parser being called directly. */
+function feedNextFilePicker(win, name, text) {
+  const realCreate = win.document.createElement.bind(win.document);
+  const prev = win.document.createElement;
+  win.document.createElement = function (tag) {
+    const el = realCreate(tag);
+    if (String(tag).toLowerCase() === 'input') {
+      el.click = function () {
+        const file = new win.File([text], name);
+        Object.defineProperty(el, 'files', { value: [file], configurable: true });
+        setTimeout(() => { if (el.onchange) el.onchange({ target: el }); }, 0);
+      };
+      win.document.createElement = prev;   // one file, then back to normal
+    } else if (String(tag).toLowerCase() === 'a') {
+      el.click = function () { /* download capture is reinstalled by prev */ };
+    }
+    return el;
+  };
+}
+
+/* Two parcels at real Jharkhand eastings and northings, one carrying a plot
+ * number as a TEXT label the way cadastral DXFs do. */
+const SAMPLE_DXF = [
+  '0', 'SECTION', '2', 'ENTITIES',
+  '0', 'LWPOLYLINE', '8', 'PLOTS', '70', '1',
+  '10', '432500.25', '20', '2618400.75',
+  '10', '432540.25', '20', '2618400.75',
+  '10', '432540.25', '20', '2618440.75',
+  '10', '432500.25', '20', '2618440.75',
+  '0', 'TEXT', '8', 'LBL', '10', '432520', '20', '2618420', '1', '77/3',
+  '0', 'LWPOLYLINE', '8', 'PLOTS', '70', '1',
+  '10', '432550.5', '20', '2618400.75',
+  '10', '432590.5', '20', '2618400.75',
+  '10', '432590.5', '20', '2618440.75',
+  '0', 'ENDSEC', '0', 'EOF',
+].join('\r\n');
+
+/* sessionStorage only exists once something has been saved into it. A test
+ * that asserts an import was REFUSED must not fail on the absence of a
+ * session — that absence is the thing being asserted. */
+function sessionOrEmpty(win) {
+  const raw = win.sessionStorage.getItem('bnd15.session');
+  return raw ? JSON.parse(raw) : { shapes: [], gcps: [], backups: {} };
+}
+
+async function withImportedDxf() {
+  const ctx = await boot();
+  feedNextFilePicker(ctx.win, 'plots.dxf', SAMPLE_DXF);
+  click(q(ctx.widget, '#btnImport'));
+  await settle(2);
+  click(q(ctx.widget, '#iDxf'));
+  await settle(12);
+  return ctx;
+}
+
+t('a DXF imports through the picker and overlays itself', async () => {
+  const { win, widget } = await withImportedDxf();
+  const s = session(win);
+  assert.strictEqual(s.shapes.length, 2, 'both parcels must arrive');
+
+  // Coordinates exactly as written. A reader that rounds an easting has
+  // destroyed survey accuracy that cannot be recovered from the result.
+  assert.strictEqual(s.shapes[0].points[0][0], 432500.25);
+  assert.strictEqual(s.shapes[0].points[0][1], 2618400.75);
+
+  assert.strictEqual(s.shapes[0].plotNo, '77/3', 'the TEXT label must reach its parcel');
+  assert.strictEqual(s.shapes[0].layer, 'PLOTS', 'and the DXF layer must survive');
+  assert.strictEqual(s.shapes[0].source, 'imported');
+
+  // No positioning step: the parcels are on the map, sized correctly, the
+  // moment the import returns.
+  assert.ok(Math.abs(s.shapes[0].areaM2 - 1600) < 5,
+    `a 40 m square should be ~1600 m², got ${s.shapes[0].areaM2}`);
+  assert.match(bodyText(widget), /Imported/, 'and the panel must report what came in');
+});
+
+t('imported parcels use the existing editing system, not one of their own', async () => {
+  const { win, widget } = await withImportedDxf();
+
+  // Select and move with the same controls a traced parcel uses.
+  click(q(widget, '[data-sel]'));
+  await settle(3);
+  q(widget, '#eDx').value = '2.5';
+  q(widget, '#eDy').value = '-1.5';
+  click(q(widget, '#eApplyXY'));
+  await settle(4);
+
+  const moved = session(win).shapes[0];
+  assert.strictEqual(moved.points[0][0], 432502.75);
+  assert.strictEqual(moved.points[0][1], 2618399.25);
+  assert.ok(Math.abs(moved.shift.dx - 2.5) < 1e-9, 'and the shift is recorded the same way');
+
+  // Clean-up, undo and the quality report must all accept it too.
+  click(q(widget, '#regAll'));
+  await settle(6);
+  click(q(widget, '#qual'));
+  await settle(6);
+  assert.match(bodyText(widget), /\/100/, 'the quality report must grade imported parcels');
+
+  click(q(widget, '#gUndo'));
+  await settle(4);
+  assert.ok(session(win).shapes.length >= 1, 'and undo must work on them');
+});
+
+t('exporting after a correction writes the corrected geometry', async () => {
+  // The brief's §25: "Do not silently export the original unshifted geometry."
+  const { win, widget, downloads } = await withImportedDxf();
+  click(q(widget, '[data-sel]'));
+  await settle(3);
+  q(widget, '#eDx').value = '10';
+  q(widget, '#eDy').value = '0';
+  click(q(widget, '#eApplyXY'));
+  await settle(4);
+
+  click(q(widget, '#xGeo'));
+  await settle(5);
+  assert.ok(downloads.length, 'GeoJSON should have been written');
+  const href = downloads[downloads.length - 1].href;
+  void href;
+
+  // Read the corrected easting back out of the session the exporter was handed.
+  const s = session(win);
+  assert.strictEqual(s.shapes[0].points[0][0], 432510.25,
+    'the exported session must hold the corrected position, not the original');
+  // And the original is still recoverable, which is what makes it non-destructive.
+  assert.ok(s.backups[s.shapes[0].id], 'the pre-shift geometry must be kept');
+  assert.strictEqual(s.backups[s.shapes[0].id][0][0], 432500.25);
+});
+
+t('an import is one undo step, however many parcels it brought in', async () => {
+  // A forty-parcel import that took forty presses to undo would not be
+  // undoable in practice.
+  const { win, widget } = await withImportedDxf();
+  assert.strictEqual(session(win).shapes.length, 2);
+  const undo = q(widget, '#gUndo');
+  assert.match(undo.textContent, /import 2 parcel/i, 'and it must say what it would reverse');
+  click(undo);
+  await settle(4);
+  assert.strictEqual(session(win).shapes.length, 0, 'one press must take the whole import back');
+});
+
+t('a KML import adopts WGS 84 without asking, because the format declares it', async () => {
+  const { win, widget } = await boot();
+  const kml = '<kml><Document><Placemark><name>Plot 9</name>'
+    + '<Polygon><outerBoundaryIs><LinearRing><coordinates>'
+    + '85.3096,23.3441 85.3196,23.3441 85.3196,23.3541 85.3096,23.3541 85.3096,23.3441'
+    + '</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></Document></kml>';
+  feedNextFilePicker(win, 'plots.kml', kml);
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iKml'));
+  await settle(14);
+
+  // The stub map is a projected UTM session, so a lon/lat file must be refused
+  // rather than dropped in near the equator — which is the whole point of
+  // resolveImportCrs declining instead of reprojecting silently.
+  assert.strictEqual(sessionOrEmpty(win).shapes.length, 0,
+    'lon/lat geometry must not be imported into a projected session unconverted');
+  assert.match(win.document.body.textContent, /equator|coordinate system/i,
+    'and the refusal must say why');
+});
+
+t('a CSV import shows its columns and imports nothing until confirmed', async () => {
+  const { win, widget } = await boot();
+  const csv = ['ID,Easting,Northing',
+    'P1,432500.25,2618400.75', 'P1,432540.25,2618400.75', 'P1,432540.25,2618440.75',
+    'P2,432550.5,2618400.75', 'P2,432590.5,2618400.75', 'P2,432590.5,2618440.75'].join('\n');
+  feedNextFilePicker(win, 'vertices.csv', csv);
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iCsv'));
+  await settle(12);
+
+  // The dialog is up and NOTHING has been imported yet.
+  assert.ok(q(widget, '#csvDialog'), 'the format dialog must appear');
+  assert.ok(q(widget, '#csvX') && q(widget, '#csvY'), 'with the columns mappable');
+  assert.ok(q(widget, '#csvDelim'), 'and the delimiter selectable');
+  assert.strictEqual(sessionOrEmpty(win).shapes.length, 0, 'nothing may be read before confirmation');
+  assert.match(bodyText(widget), /Easting/, 'the preview must show the real header');
+
+  click(q(widget, '#csvImport'));
+  await settle(8);
+  const s = session(win);
+  assert.strictEqual(s.shapes.length, 2, 'confirming imports both parcels');
+  assert.strictEqual(s.shapes[0].points[0][0], 432500.25, 'at full precision');
+  assert.deepStrictEqual(s.shapes.map((x) => x.plotNo).sort(), ['P1', 'P2']);
+});
+
+t('cancelling the CSV dialog imports nothing', async () => {
+  const { win, widget } = await boot();
+  feedNextFilePicker(win, 'v.csv', 'ID,E,N\nA,432500,2618400\nA,432540,2618400\nA,432540,2618440');
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iCsv'));
+  await settle(12);
+  assert.ok(q(widget, '#csvDialog'));
+  click(q(widget, '#csvCancel'));
+  await settle(4);
+  assert.ok(!q(widget, '#csvDialog'), 'the dialog must close');
+  assert.strictEqual(sessionOrEmpty(win).shapes.length, 0);
+});

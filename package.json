@@ -1,0 +1,34 @@
+{
+  "name": "cadastral-digitizer",
+  "version": "17.0.0",
+  "private": true,
+  "description": "Browser extension for digitizing cadastral and GIS parcels from map portals, scanned sheets, images and PDF pages. This package.json exists only to run the test suite; the extension itself ships as plain unbundled files with no runtime dependencies.",
+  "author": "Md Salim Ansari",
+  "license": "MIT",
+  "homepage": "https://github.com/emailofsalim/bhunaksha-digitizer",
+  "scripts": {
+    "test": "node --test 'test/*.test.js'",
+    "test:browser": "node --test 'test/browser_integration.test.js'",
+    "test:chrome": "node --test --test-concurrency=1 'test/chrome_e2e.test.js'"
+  },
+  "//": [
+    "Both dev dependencies are OPTIONAL. With neither installed, `npm test` still",
+    "runs 477 tests and the 72 that need a browser skip cleanly — which is what",
+    "makes the suite useful to someone who has just unzipped the extension.",
+    "  npm install --no-save jsdom            enables 58 DOM integration tests",
+    "  npm install --no-save playwright-core  enables 14 real-Chrome E2E tests",
+    "playwright-core also needs a Chrome binary on the machine; the E2E file looks",
+    "for the usual locations and skips if it finds none.",
+    "",
+    "--test-force-exit was removed in 16.3.0. It was added to stop the runner",
+    "hanging on jsdom timers and Playwright contexts, but once those were being",
+    "closed properly it was no longer needed -- and it was TRUNCATING the TAP",
+    "output, so consecutive runs reported 414, 416 and 418 tests from an unchanged",
+    "suite. A run that can silently drop results can silently drop a failure, which",
+    "defeats the point of having the suite."
+  ],
+  "devDependencies": {
+    "jsdom": "^24.0.0",
+    "playwright-core": "^1.40.0"
+  }
+}
