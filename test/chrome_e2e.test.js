@@ -90,6 +90,15 @@ function stageExtension() {
   for (const f of ['manifest.json', 'background.js', 'content.js', 'page_inject.js',
     'popup.html', 'popup.js', 'icon16.png', 'icon48.png', 'icon128.png']) copy(f);
   for (const f of fs.readdirSync(path.join(ROOT, 'lib'))) copy(path.join('lib', f));
+  // vendor/ carries PDF.js, which the service worker injects on demand. Staged
+  // only when present, so a checkout without it still runs everything else here
+  // and the PDF test says plainly what is missing rather than failing obscurely.
+  const vendorDir = path.join(ROOT, 'vendor');
+  if (fs.existsSync(vendorDir)) {
+    for (const f of fs.readdirSync(vendorDir)) {
+      if (/\.js$/i.test(f)) copy(path.join('vendor', f));
+    }
+  }
 
   const m = JSON.parse(fs.readFileSync(path.join(extDir, 'manifest.json'), 'utf8'));
   m.host_permissions = ['<all_urls>'];
@@ -484,15 +493,38 @@ t('a captured image can be opened as a workspace and traced', async () => {
  * a page, standing in for a parcel on a cadastral sheet.
  * =================================================================== */
 
-function minimalPdf() {
-  // A parcel-coloured rectangle (RGB 0.94, 0.86, 0.71) on a 400x300 page.
-  const content = '0.94 0.86 0.71 rg\n60 50 280 200 re f\n0 0 0 RG 2 w\n60 50 280 200 re S\n';
-  const objs = [
-    '<</Type/Catalog/Pages 2 0 R>>',
-    '<</Type/Pages/Kids[3 0 R]/Count 1>>',
-    '<</Type/Page/Parent 2 0 R/MediaBox[0 0 400 300]/Contents 4 0 R/Resources<<>>>>',
-    `<</Length ${content.length}>>\nstream\n${content}endstream`,
-  ];
+/* A PDF of `pageCount` pages, each carrying one filled rectangle in a colour
+ * this suite can look for afterwards. Generated rather than committed as a
+ * binary so its contents are visible and adjustable, and so the multi-page case
+ * costs nothing to produce.
+ *
+ * Page colours are deliberately far apart in RGB: turning a page is verified by
+ * counting pixels of the NEW page's colour and confirming the old page's colour
+ * has gone, which only works if the two cannot be confused. */
+const PDF_PAGE_COLOURS = [
+  { pdf: '0.94 0.86 0.71', rgb: [240, 219, 181] },  // parcel buff
+  { pdf: '0.20 0.40 0.85', rgb: [51, 102, 217] },   // blue
+  { pdf: '0.15 0.65 0.30', rgb: [38, 166, 77] },    // green
+];
+
+function minimalPdf(pageCount) {
+  const pages = Math.max(1, Math.min(Number(pageCount) || 1, PDF_PAGE_COLOURS.length));
+  // Object numbering: 1 = catalog, 2 = pages tree, then a page + its content
+  // stream per page, in pairs.
+  const kids = [];
+  const objs = ['', ''];   // filled in below, once the kid ids are known
+  for (let i = 0; i < pages; i++) {
+    const pageId = 3 + i * 2;
+    const contentId = pageId + 1;
+    kids.push(`${pageId} 0 R`);
+    const colour = PDF_PAGE_COLOURS[i].pdf;
+    const content = `${colour} rg\n60 50 280 200 re f\n0 0 0 RG 2 w\n60 50 280 200 re S\n`;
+    objs[pageId - 1] = `<</Type/Page/Parent 2 0 R/MediaBox[0 0 400 300]/Contents ${contentId} 0 R/Resources<<>>>>`;
+    objs[contentId - 1] = `<</Length ${content.length}>>\nstream\n${content}endstream`;
+  }
+  objs[0] = '<</Type/Catalog/Pages 2 0 R>>';
+  objs[1] = `<</Type/Pages/Kids[${kids.join(' ')}]/Count ${pages}>>`;
+
   let pdf = '%PDF-1.4\n';
   const offsets = [];
   objs.forEach((body, i) => {
@@ -579,6 +611,166 @@ t('a real PDF in Chrome\'s viewer can be captured and digitized', async () => {
   assert.ok(analysis.hits > 2000,
     `the PDF's rectangle should be present in the captured pixels; found only ${analysis.hits} ` +
     'matching pixels, which suggests the viewer had not painted yet');
+});
+
+/* =====================================================================
+ * PDF IMPORT, THROUGH THE UI, RENDERED BY THE EXTENSION ITSELF
+ *
+ * The test above proves the capture fallback. This proves the primary path,
+ * which is a different mechanism end to end: the operator picks the PDF file,
+ * the service worker injects the vendored PDF.js into the page's own world, the
+ * page renders one page to a canvas at tracing resolution, and that canvas is
+ * handed to the SAME raster workspace an image import uses.
+ *
+ * Nothing here is stubbed. A real file chooser answers with a real PDF on disk,
+ * PDF.js really parses it, and the assertions are made against the pixels that
+ * came out the other end. Being able to select a file proves nothing on its own,
+ * so the check that matters is the last one: the sheet's rectangle is present in
+ * the workspace's pixels.
+ * =================================================================== */
+
+/* Count pixels close to an RGB triple in the workspace's display canvas.
+ * Works because the render target is a canvas the extension drew into itself —
+ * no cross-origin taint, so getImageData is readable. */
+const COUNT_IN_WORKSPACE = (rgb) => {
+  const c = document.querySelector('#bnd15-raster-workspace canvas');
+  if (!c) return { ok: false, error: 'no workspace canvas' };
+  const ctx2 = c.getContext('2d');
+  const img = ctx2.getImageData(0, 0, c.width, c.height);
+  let hits = 0;
+  for (let i = 0; i < img.data.length; i += 4) {
+    const dr = img.data[i] - rgb[0], dg = img.data[i + 1] - rgb[1], db = img.data[i + 2] - rgb[2];
+    if (dr * dr + dg * dg + db * db < 1200) hits++;
+  }
+  return { ok: true, hits, w: c.width, h: c.height };
+};
+
+/* Pick a PDF through the extension's own Import menu, exactly as an operator
+ * does. page_inject builds a real <input type="file"> and clicks it, so Chrome
+ * raises a real chooser and Playwright answers it. */
+async function importPdfThroughUi(page, pdfPath) {
+  const chooser = page.waitForEvent('filechooser', { timeout: 20000 });
+  await page.click('#bnd15-widget #btnImport');
+  await page.click('#bnd15-widget #iPdf');
+  (await chooser).setFiles(pdfPath);
+  // Generous: this is where 1.4 MB of PDF.js is injected into the page world,
+  // parsed, and asked to rasterise a page at 2400 px on its long edge.
+  await page.waitForSelector('#bnd15-raster-workspace', { timeout: 45000 });
+  await page.waitForFunction(
+    () => /px/.test(document.querySelector('#bnd15-widget').textContent),
+    null, { timeout: 15000 });
+}
+
+t('a picked PDF is rendered by the extension itself and reaches the raster workspace', async () => {
+  if (!fs.existsSync(path.join(ROOT, 'vendor', 'pdf.min.js'))) {
+    assert.fail('vendor/pdf.min.js is missing — the PDF renderer is not vendored in this checkout');
+  }
+  const { page } = await openFixtureWithExtension();
+  const pdfPath = path.join(tmpRoot, 'parcel-sheet.pdf');
+  fs.writeFileSync(pdfPath, Buffer.from(minimalPdf(1), 'latin1'));
+
+  // Watched from here on, because "no CDN, works offline" is a claim the Chrome
+  // Web Store submission makes in writing. PDF.js will fetch character maps and
+  // standard font data if it is configured with URLs for them; it is not, and
+  // this is how that stays true.
+  const requests = [];
+  page.on('request', (r) => requests.push(r.url()));
+
+  await importPdfThroughUi(page, pdfPath);
+
+  assert.deepStrictEqual(requests, [],
+    `importing a PDF must touch the network zero times; it made: ${requests.join(', ')}`);
+
+  // The renderer really was injected into the PAGE's world by the worker. If it
+  // had landed in the isolated world, page.evaluate would not see it — and the
+  // import could not have worked at all.
+  const hasPdfJs = await page.evaluate(() => typeof window.pdfjsLib);
+  assert.strictEqual(hasPdfJs, 'object',
+    'the service worker must inject vendor/pdf.min.js into the MAIN world');
+
+  // Rendered at tracing resolution, not screen resolution: a 400x300 pt page
+  // with a 2400 px target long edge is 2400x1800. This is the difference
+  // between the real import and the capture fallback, so it is asserted exactly.
+  const text = await page.textContent('#bnd15-widget');
+  assert.match(text, /parcel-sheet\.pdf/, `the sheet name should be shown: ${text.slice(0, 400)}`);
+  assert.match(text, /2400×1800 px/,
+    `the page should be rendered at the target long edge, not at screen size: ${text.slice(0, 400)}`);
+
+  // THE CHECK THAT MATTERS. Selecting a file proves nothing; these are the
+  // PDF's own pixels, in the workspace, ready to trace.
+  const buff = await page.evaluate(COUNT_IN_WORKSPACE, PDF_PAGE_COLOURS[0].rgb);
+  assert.strictEqual(buff.ok, true, buff.error);
+  assert.ok(buff.hits > 20000,
+    `the PDF's parcel rectangle must be present in the workspace pixels; found ${buff.hits}`);
+
+  // And the workspace is a workspace: coordinates are image pixels, and the
+  // digitizing tools are live on it.
+  assert.match(text, /image pixels/, 'the session must say its coordinates are pixels, not metres');
+  const traceEnabled = await page.$eval('#bnd15-widget #mTrace', (el) => !el.disabled);
+  assert.strictEqual(traceEnabled, true, 'the sheet must be digitizable once it is open');
+});
+
+t('turning a page of a multi-page PDF replaces the sheet and keeps the digitised parcels', async () => {
+  const { page } = await openFixtureWithExtension();
+  const pdfPath = path.join(tmpRoot, 'three-page-sheet.pdf');
+  fs.writeFileSync(pdfPath, Buffer.from(minimalPdf(3), 'latin1'));
+
+  await importPdfThroughUi(page, pdfPath);
+
+  const text = await page.textContent('#bnd15-widget');
+  assert.match(text, /PDF page 1 of 3/, `the page selector should appear for a multi-page PDF: ${text.slice(0, 400)}`);
+
+  // Digitize a parcel on page 1. Drawn rather than colour-traced so the shape is
+  // deterministic: what is under test here is that it SURVIVES, not how it was
+  // made. The clicks stay in the left half of the viewport, clear of the widget
+  // panel, which sits bottom-right.
+  await page.click('#bnd15-widget #mDraw');
+  for (const [x, y] of [[200, 200], [500, 200], [500, 500], [200, 500]]) {
+    await page.mouse.click(x, y);
+  }
+  await page.click('#bnd15-widget #dFinish');
+  await page.waitForFunction(
+    () => /Shape 1/.test(document.querySelector('#bnd15-widget').textContent),
+    null, { timeout: 15000 });
+
+  const before = await page.evaluate(() => {
+    const m = document.querySelector('#bnd15-widget').textContent.match(/Shape 1 · (\d+)v/);
+    return m ? m[1] : null;
+  });
+  assert.strictEqual(before, '4', 'the drawn parcel should have four corners');
+
+  // The page selector lives inside the drawing section, which is collapsed
+  // until asked for. Real Chrome will not click through a closed <details>, so
+  // it is opened the way an operator opens it.
+  await page.click('#bnd15-widget details[data-sect="drawing"] > summary');
+  await page.waitForSelector('#bnd15-widget #pdfNext', { state: 'visible', timeout: 10000 });
+
+  // Turn the page.
+  await page.click('#bnd15-widget #pdfNext');
+  await page.waitForFunction(
+    () => /PDF page 2 of 3/.test(document.querySelector('#bnd15-widget').textContent),
+    null, { timeout: 30000 });
+
+  // The sheet underneath really changed: page 2's blue rectangle is there and
+  // page 1's buff one has gone.
+  // Exactly one workspace, not two stacked on top of each other. A replaced
+  // sheet is destroyed rather than left behind the new one — id collisions are
+  // invisible until something reads the wrong canvas.
+  const containers = await page.$$eval('[id="bnd15-raster-workspace"]', (els) => els.length);
+  assert.strictEqual(containers, 1, 'turning a page must replace the sheet, not stack another on it');
+
+  const blue = await page.evaluate(COUNT_IN_WORKSPACE, PDF_PAGE_COLOURS[1].rgb);
+  const oldBuff = await page.evaluate(COUNT_IN_WORKSPACE, PDF_PAGE_COLOURS[0].rgb);
+  assert.ok(blue.hits > 20000, `page 2's rectangle should now be on screen; found ${blue.hits}`);
+  assert.ok(oldBuff.hits < 500, `page 1's rectangle should be gone; ${oldBuff.hits} pixels remain`);
+
+  // And what the operator drew is untouched. This is the whole point of
+  // preserveSession: the picture is the sheet, the parcels are their work.
+  const after = await page.textContent('#bnd15-widget');
+  assert.match(after, /Shape 1 · 4v/,
+    `the digitised parcel must survive a page turn: ${after.slice(0, 400)}`);
+  assert.match(after, /three-page-sheet\.pdf — page 2 of 3/,
+    'the sheet label should name the page being digitised');
 });
 
 /* =====================================================================

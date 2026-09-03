@@ -80,11 +80,17 @@ function collect() {
     add(icon, `manifest.icons["${size}"]`);
   }
 
-  // The page-world payload, in the order background.js injects it.
+  // Every list of files background.js declares for injection. Matched by the
+  // *_FILES naming convention rather than by name, so a list added later —
+  // PDFJS_FILES was — ships without anyone having to remember this script.
   const bg = readText(manifest.background.service_worker);
-  const block = bg.match(/MAIN_WORLD_FILES\s*=\s*\[([^\]]*)\]/);
-  if (!block) fail('background.js no longer declares MAIN_WORLD_FILES — this script reads it to know what to ship.');
-  for (const m of block[1].matchAll(/'([^']+)'/g)) add(m[1], 'background.js MAIN_WORLD_FILES');
+  const lists = [...bg.matchAll(/(\w*_?FILES)\s*=\s*\[([^\]]*)\]/g)];
+  if (!lists.length) fail('background.js declares no *_FILES list — this script reads those to know what to ship.');
+  let named = 0;
+  for (const [, listName, body] of lists) {
+    for (const m of body.matchAll(/'([^']+)'/g)) { add(m[1], `background.js ${listName}`); named++; }
+  }
+  if (!named) fail('background.js declares file lists but none name any files.');
 
   // Any other file the worker injects by name, e.g. the isolated-world bridge.
   for (const m of bg.matchAll(/files:\s*\[\s*'([^']+)'\s*\]/g)) {
