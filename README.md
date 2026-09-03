@@ -8,7 +8,8 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
-**Tests:** `npm test` — 567 tests. No install needed: 491 run immediately, and 76 that need a browser skip cleanly. To enable those:
+**Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store.
+**Tests:** `npm test` — 572 tests. No install needed: 496 run immediately, and 76 that need a browser skip cleanly. To enable those:
 
 ```bash
 npm install --no-save jsdom            # 62 DOM integration tests
@@ -385,6 +386,16 @@ test/                  549 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```
+
+### Packaging for the Chrome Web Store
+
+`npm run package` writes `dist/cadastral-digitizer-<version>.zip` — 21 files, about 550 KB, with `manifest.json` at the root as the store requires.
+
+**The file list is derived, never written down.** It is read from the extension's own declarations: the manifest's service worker, popup and icons; `background.js`'s `MAIN_WORLD_FILES`; the popup's own `<script src>`. A hand-maintained list is exactly what goes stale — add a library to `lib/`, forget to add it here, and Chrome accepts an upload that installs cleanly and then dies on first use, in the store, where fixing it costs a review cycle. There is a test that injects precisely that mistake and confirms the suite catches it.
+
+`node_modules`, `test/`, `.github/`, `scripts/` and the working documents stay out, and that is *asserted* rather than assumed: anything not derived from a declaration is refused outright. The script also refuses to build if the manifest has grown `host_permissions`, since a store build quietly requesting standing host access would be a different product from the one the listing describes.
+
+No dependencies, and no second ZIP writer: the archive is built with the project's own `makeZipBytes` — already used for KMZ and Shapefile export, already tested by parsing its bytes back and by handing them to the system `unzip` — then read back with the project's own ZIP reader, so a package that cannot be opened is never handed over as if it could. Shelling out to `zip` would work on this machine and not on the Windows ones this is developed on.
 
 ### Test suite
 

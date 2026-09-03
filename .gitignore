@@ -6,3 +6,6 @@ package-lock.json
 # Scratch
 *.log
 .DS_Store
+
+# Store packages built by `npm run package`.
+dist/

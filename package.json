@@ -9,11 +9,12 @@
   "scripts": {
     "test": "node --test 'test/*.test.js'",
     "test:browser": "node --test 'test/browser_integration.test.js'",
-    "test:chrome": "node --test --test-concurrency=1 'test/chrome_e2e.test.js'"
+    "test:chrome": "node --test --test-concurrency=1 'test/chrome_e2e.test.js'",
+    "package": "node scripts/package.js"
   },
   "//": [
     "Both dev dependencies are OPTIONAL. With neither installed, `npm test` still",
-    "runs 491 tests and the 76 that need a browser skip cleanly — which is what",
+    "runs 496 tests and the 76 that need a browser skip cleanly \u2014 which is what",
     "makes the suite useful to someone who has just unzipped the extension.",
     "  npm install --no-save jsdom            enables 62 DOM integration tests",
     "  npm install --no-save playwright-core  enables 14 real-Chrome E2E tests",
