@@ -41,6 +41,9 @@ jobs:
   zero-install:
     name: No install (the unzip-and-run promise)
     runs-on: ubuntu-latest
+    # The suite takes well under a minute; anything approaching this is a hang,
+    # and a hang must fail visibly rather than sit on a runner for six hours.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -61,6 +64,11 @@ jobs:
   full:
     name: Full suite (jsdom + real Chrome)
     runs-on: ubuntu-latest
+    # Locally the whole suite, Chrome included, is about 30 seconds. The first
+    # CI run of this job sat at seven minutes with no output, so it is bounded:
+    # a test runner that does not exit has to be a failure with logs, not an
+    # occupied runner.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
