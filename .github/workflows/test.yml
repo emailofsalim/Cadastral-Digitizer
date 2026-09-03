@@ -11,12 +11,17 @@
 #      rather than failing. A change that quietly makes jsdom mandatory would
 #      pass every other check and break exactly that promise, so it gets a job.
 #
-#   2. `full` installs both optional dev dependencies and runs everything,
-#      including the real-Chrome end-to-end tests against the runner's
-#      preinstalled Google Chrome. These are the tests that catch what a
+#   2. `full` installs both optional dev dependencies plus Playwright's own
+#      Chromium, and runs everything including the end-to-end tests with the
+#      extension really installed in a real browser. These catch what a
 #      simulated DOM cannot — most recently that jsdom will happily click a
 #      button inside a collapsed section while a real browser refuses, because
 #      jsdom has no layout.
+#
+#      Deliberately NOT the runner's preinstalled Google Chrome: from Chrome
+#      137 the stable channel refuses `--load-extension` in headless mode, so
+#      it would load no extension at all and every one of these tests would sit
+#      on its timeout. See the step below.
 #
 # The extension itself has no runtime dependencies and ships unbundled, so there
 # is nothing to build and no lockfile to cache.
@@ -77,20 +82,30 @@ jobs:
           node-version: '22.x'
 
       # Both are optional and deliberately not saved: the extension has no
-      # dependencies, and package.json says so.
+      # dependencies, and package.json says so. The full `playwright` package
+      # rather than `playwright-core` because only it ships the browser
+      # installer; the suite still requires playwright-core, which comes with it.
       - name: Install the optional test dependencies
-        run: npm install --no-save jsdom playwright-core
+        run: npm install --no-save jsdom playwright
 
-      # The E2E suite looks for a browser in a few known locations and skips if
-      # it finds none. Failing loudly here instead means a silently skipped E2E
-      # run cannot be mistaken for a passing one.
-      - name: Confirm a Chrome binary is available
+      # Playwright's own Chromium, NOT the runner's preinstalled Google Chrome.
+      #
+      # This is the fix for a job that used to hang for the full timeout. From
+      # Chrome 137 the stable channel refuses `--load-extension` in headless
+      # mode, so an installed google-chrome loads no extension at all: no
+      # service worker ever registers and all fourteen end-to-end tests sit on
+      # their timeouts. Playwright's build has no such restriction and is the
+      # same engine, so nothing is given up by using it.
+      - name: Install Playwright's Chromium
+        run: npx playwright install --with-deps chromium
+
+      # A browser that cannot be found means the E2E tests skip, and a silently
+      # skipped end-to-end run must not be mistakable for a passing one.
+      - name: Confirm the browser is present
         run: |
-          for p in /usr/local/bin/chrome /usr/bin/google-chrome /usr/bin/chromium; do
-            if [ -x "$p" ]; then echo "found $p"; exit 0; fi
-          done
-          echo "No Chrome binary found; the end-to-end tests would skip silently."
-          exit 1
+          exe=$(node -e "console.log(require('playwright-core').chromium.executablePath())")
+          echo "playwright chromium: $exe"
+          test -x "$exe" || { echo "Playwright's Chromium is missing; the E2E tests would skip."; exit 1; }
 
       # A skip is legitimate on a developer's machine and not here, where both
       # dependencies and a browser are known to be present — so the skip count

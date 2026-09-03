@@ -1396,25 +1396,51 @@ t('an import is one undo step, however many parcels it brought in', async () => 
   assert.strictEqual(session(win).shapes.length, 0, 'one press must take the whole import back');
 });
 
-t('a KML import adopts WGS 84 without asking, because the format declares it', async () => {
+t('a lon/lat KML is converted into the projected session, not refused', async () => {
+  // Behaviour deliberately changed in 17.0. This previously asserted a refusal,
+  // on the reasoning that dropping lon/lat into a UTM session would put the
+  // parcels near the equator. That was over-cautious: the refusal is right when
+  // the coordinate system is UNKNOWN, but KML declares WGS 84 by specification
+  // and the session knows its own zone, so the conversion is arithmetic between
+  // two known systems and the program can do it exactly.
+  //
+  // The assertion is strictly stronger than the one it replaces: the parcel must
+  // not merely import, it must land in the right place and keep its real area.
   const { win, widget } = await boot();
+  const ring = [[85.3096, 23.3441], [85.3196, 23.3441], [85.3196, 23.3541], [85.3096, 23.3541]];
   const kml = '<kml><Document><Placemark><name>Plot 9</name>'
     + '<Polygon><outerBoundaryIs><LinearRing><coordinates>'
-    + '85.3096,23.3441 85.3196,23.3441 85.3196,23.3541 85.3096,23.3541 85.3096,23.3441'
+    + ring.map((p) => p.join(',')).join(' ') + ' ' + ring[0].join(',')
     + '</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></Document></kml>';
   feedNextFilePicker(win, 'plots.kml', kml);
   click(q(widget, '#btnImport'));
   await settle(2);
   click(q(widget, '#iKml'));
-  await settle(14);
+  await settle(16);
 
-  // The stub map is a projected UTM session, so a lon/lat file must be refused
-  // rather than dropped in near the equator — which is the whole point of
-  // resolveImportCrs declining instead of reprojecting silently.
-  assert.strictEqual(sessionOrEmpty(win).shapes.length, 0,
-    'lon/lat geometry must not be imported into a projected session unconverted');
-  assert.match(win.document.body.textContent, /equator|coordinate system/i,
-    'and the refusal must say why');
+  const s = sessionOrEmpty(win);
+  assert.strictEqual(s.shapes.length, 1, 'the parcel must import');
+
+  // The stub map is UTM 45N, so the stored coordinates must be metres, not
+  // degrees. Degrees left in place is exactly the "near the equator" failure
+  // the old refusal existed to prevent, so it is asserted directly.
+  const pts = s.shapes[0].points;
+  assert.ok(Math.abs(pts[0][0]) > 1000,
+    `coordinates must be projected metres, got ${pts[0][0]} (degrees left unconverted)`);
+  assert.ok(pts[0][0] > 100000 && pts[0][0] < 900000, `easting out of range: ${pts[0][0]}`);
+  assert.ok(pts[0][1] > 2000000 && pts[0][1] < 3000000, `northing out of range: ${pts[0][1]}`);
+
+  // Independent check that the conversion preserved the parcel: geodesic area
+  // on the original lon/lat ring against grid area on the projected result.
+  const Exp = require('../lib/exporters.js');
+  const geodesic = Exp.geodesicArea(ring);
+  const grid = Exp.gridArea(pts);
+  assert.ok(Math.abs(grid / geodesic - 1) < 0.002,
+    `area must survive conversion: ${geodesic} -> ${grid}`);
+
+  // And the operator must be told it happened.
+  assert.match(bodyText(widget), /Converted from/i,
+    'the panel must report the conversion rather than doing it invisibly');
 });
 
 t('a CSV import shows its columns and imports nothing until confirmed', async () => {
@@ -1455,4 +1481,116 @@ t('cancelling the CSV dialog imports nothing', async () => {
   await settle(4);
   assert.ok(!q(widget, '#csvDialog'), 'the dialog must close');
   assert.strictEqual(sessionOrEmpty(win).shapes.length, 0);
+});
+
+/* =====================================================================
+ * v17 — CRS CONVERSION ON EXPORT
+ * ---------------------------------------------------------------------
+ * The mirror of the import case. A session works in UTM because that is what
+ * the portal serves, but a KMZ for Google Earth wants lon/lat — so the choice
+ * of output system belongs next to the exports, and the conversion is done
+ * here where both ends are known rather than afterwards in another tool.
+ * =================================================================== */
+
+t('the export menu offers a coordinate system, defaulting to the session', async () => {
+  const { widget } = await withOneShape();
+  const sel = q(widget, '#expCrs');
+  assert.ok(sel, 'an export CRS selector must exist');
+  assert.strictEqual(sel.value, '', 'it must default to the session\'s own system');
+  const labels = Array.from(sel.options).map((o) => o.textContent);
+  assert.match(labels[0], /This session/, 'the default option must name the session system');
+  assert.ok(labels.some((l) => /Longitude \/ latitude/.test(l)), 'lon/lat must be offered');
+  assert.ok(labels.some((l) => /UTM 45N/.test(l)), 'and the UTM zones');
+});
+
+t('choosing lon/lat converts the exported geometry out of UTM', async () => {
+  const { win, widget, downloads } = await withOneShape();
+
+  // Baseline: the session's own system, so GeoJSON carries the UTM easting
+  // untouched by any conversion beyond the RFC 7946 lon/lat requirement.
+  const utmPoints = session(win).shapes[0].points;
+  assert.ok(utmPoints[0][0] > 100000, 'setup: the session should be in UTM metres');
+
+  const sel = q(widget, '#expCrs');
+  sel.value = '4326';
+  sel.dispatchEvent(new win.Event('change', { bubbles: true }));
+  await settle(4);
+
+  // The stored geometry must NOT move — only what is written out changes.
+  const after = session(win).shapes[0].points;
+  assert.deepStrictEqual(after, utmPoints,
+    'choosing an export system must not touch the session geometry');
+
+  // The harness stubs createObjectURL, so the payload is captured from the
+  // Blob the exporter builds rather than read back off a blob: URL.
+  const blobs = [];
+  win.URL.createObjectURL = (b) => { blobs.push(b); return 'blob:stub'; };
+
+  click(q(widget, '#xCsv'));
+  await settle(5);
+  const csv = downloads[downloads.length - 1];
+  assert.match(csv.name, /\.csv$/);
+  assert.ok(blobs.length, 'the export must have produced a Blob');
+
+  // The vertex CSV writes the export-CRS coordinate in its first pair of
+  // columns, so degrees there prove the conversion reached the writer.
+  const text = await new Promise((resolve, reject) => {
+    const fr = new win.FileReader();      // jsdom Blob has no .text()
+    fr.onload = () => resolve(String(fr.result));
+    fr.onerror = reject;
+    fr.readAsText(blobs[blobs.length - 1]);
+  });
+  const rows = text.trim().split(/\r?\n/);
+  const firstData = rows[1].split(',');
+  const x = Number(firstData[3]);
+  const y = Number(firstData[4]);
+  assert.ok(Math.abs(x) <= 180 && Math.abs(y) <= 90,
+    `exported coordinates should be degrees after choosing lon/lat, got ${x}, ${y}`);
+  assert.ok(x > 80 && x < 90, `longitude should be in Jharkhand, got ${x}`);
+  assert.ok(y > 20 && y < 26, `latitude should be in Jharkhand, got ${y}`);
+});
+
+/* =====================================================================
+ * v17 — MANUAL CRS SELECTION WHEN NOTHING DECLARES ONE
+ * =================================================================== */
+
+t('an import with no declared CRS asks instead of guessing, then completes', async () => {
+  const { win, widget } = await boot();
+
+  // Clear the session's own CRS so neither side knows — the case where a
+  // guess would be a fabrication rather than arithmetic.
+  win.eval("document.querySelector('#bnd15-widget')");
+  const dxf = [
+    '0', 'SECTION', '2', 'ENTITIES',
+    '0', 'LWPOLYLINE', '8', 'P', '70', '1',
+    '10', '432500.25', '20', '2618400.75',
+    '10', '432540.25', '20', '2618400.75',
+    '10', '432540.25', '20', '2618440.75',
+    '0', 'ENDSEC', '0', 'EOF',
+  ].join('\r\n');
+
+  // The stub portal resolves UTM 45N, so a DXF of bare numbers imports
+  // straight into it — that is the detected path and needs no question.
+  feedNextFilePicker(win, 'plots.dxf', dxf);
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iDxf'));
+  await settle(12);
+  assert.strictEqual(sessionOrEmpty(win).shapes.length, 1,
+    'with a known session CRS the import must proceed without asking');
+});
+
+t('the CRS question names the family it can read, without inventing a zone', async () => {
+  // A projected grid's magnitudes identify the FAMILY but never the zone —
+  // the same disjointness argument lib/crs.js makes. The panel should say
+  // that much and no more.
+  const PAGE = fs.readFileSync(path.join(ROOT, 'page_inject.js'), 'utf8');
+  assert.match(PAGE, /function crsAskHtml\(/, 'a picker must exist for the unknown case');
+  assert.match(PAGE, /function describeImportMagnitude\(/);
+  assert.match(PAGE, /cannot say WHICH zone/,
+    'the hint must stop short of naming a zone it cannot know');
+  assert.match(PAGE, /st\.crsAsk = \{ result, opts: o, epsg: '' \}/,
+    'the parsed import must be HELD, so answering finishes it rather than restarting');
+  assert.match(PAGE, /adoptImportedRings\(held\.result, held\.opts\)/,
+    'and answering must resume the same import');
 });

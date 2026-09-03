@@ -930,13 +930,25 @@ test('R18-2: an import overlays automatically and never repositions geometry', (
     'imported coordinates must be carried through unchanged');
 });
 
-test('R18-2b: an import asks for the CRS rather than guessing it', () => {
+test('R18-2b: an import asks when the CRS is unknown, and converts when it is not', () => {
+  // Two different situations that must not be conflated. With NO declared
+  // system, guessing would put parcels in the wrong district, so it asks. With
+  // a declared one, the conversion to the session's system is arithmetic, so it
+  // converts -- and says so.
   assert.match(PAGE, /function resolveImportCrs\(/);
   const fn = PAGE.match(/function resolveImportCrs\([\s\S]*?\n  \}/)[0];
   assert.match(fn, /ask: true/, 'with no evidence it must ask, not assume');
   assert.match(fn, /not stated in the file/);
-  // And a lon/lat file must not be silently dropped into a projected session.
-  assert.match(fn, /near the equator/);
+  assert.match(fn, /Crs\.crsEquivalent\(result\.crs, sessionCrs\)/,
+    'a declared but different system must be detected');
+  assert.match(fn, /convertFrom: result\.crs/,
+    'and converted rather than refused');
+  assert.match(PAGE, /Crs\.reprojectRing\(r\.points, crsCheck\.convertFrom, crsCheck\.crs\)/,
+    'the geometry must actually be reprojected before it becomes a shape');
+  // An inexact conversion -- one into a datum whose shift this build does not
+  // apply -- has to be stated at import time.
+  assert.match(PAGE, /!crsCheck\.plan\.exact/,
+    'an approximate conversion must be reported, not done silently');
 });
 
 test('R18-3/4: move, rotate and scale exist and record a separate shift', () => {
@@ -1219,4 +1231,49 @@ test('R16g: the end-to-end suite drives the extension over http, never file://',
   assert.match(code, /http\.createServer/, 'the fixtures must be served');
   assert.match(code, /fixtureServer\.unref\(\)/,
     'and the listening socket must not be able to hold the runner open');
+});
+
+test('R16h: a failed browser launch cannot leave the test runner hanging', () => {
+  // This was the CI hang. The launch helper registered its browser context for
+  // cleanup only AFTER waiting for the extension's service worker, so when that
+  // wait timed out the throw skipped the registration, `after` closed nothing,
+  // and a live Chrome held Node's event loop open until the job was killed.
+  // --test-force-exit was removed in 16.3.0, so an unclosed handle is not a
+  // slow suite -- it is an infinite one.
+  const e2e = read('test/chrome_e2e.test.js');
+  // Comments stripped first: the explanation above the fix necessarily names
+  // waitForEvent, and matching that instead of the call would make this test
+  // pass on the prose rather than on the code.
+  const launch = e2e.match(/function launch\(\)[\s\S]*?\n\}/)[0]
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  const pushAt = launch.indexOf('allContexts.push(ctx)');
+  const waitAt = launch.indexOf('waitForEvent');
+  assert.ok(pushAt > 0, 'the launched context must be registered for cleanup');
+  assert.ok(waitAt > 0, 'the service-worker wait must still be there');
+  assert.ok(pushAt < waitAt,
+    'the context must be registered for cleanup BEFORE anything that can throw, '
+    + 'or a failed launch leaks a browser and hangs the runner');
+});
+
+test('R16i: the E2E suite prefers a browser that can load an unpacked extension', () => {
+  // Chrome 137+ refuses --load-extension headlessly, so an installed
+  // google-chrome silently loads nothing: chrome://extensions lists zero items
+  // and no service worker ever appears. Playwright's Chromium has no such
+  // restriction, so it must be looked for first and Chrome kept as a fallback.
+  const e2e = read('test/chrome_e2e.test.js');
+  const block = e2e.match(/const CHROME = \(\(\) => \{[\s\S]*?\}\)\(\);/);
+  assert.ok(block, 'browser discovery must be explicit about its ordering');
+  const src = block[0];
+  const pw = src.indexOf('chromium.executablePath()');
+  const chrome = src.indexOf('google-chrome');
+  assert.ok(pw > 0 && chrome > 0, 'both candidates should be considered');
+  assert.ok(pw < chrome,
+    "Playwright's Chromium must be preferred over an installed Google Chrome");
+  // And the failure must name the remedy rather than timing out anonymously.
+  assert.match(e2e, /npx playwright install chromium/);
+
+  // CI must install that browser rather than relying on the runner's Chrome.
+  const wf = read('.github/workflows/test.yml');
+  assert.match(wf, /npx playwright install --with-deps chromium/);
 });
