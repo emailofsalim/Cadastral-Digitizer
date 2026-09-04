@@ -1967,6 +1967,40 @@ t('a DXF exported in absolute mode is never double-shifted', async () => {
     `an absolute export must import unchanged, got ${Math.min(...xs)}..${Math.max(...xs)}`);
 });
 
+t('a DXF holding lon/lat is never shifted by a recorded origin', async () => {
+  // DXF can hold degrees. An origin in metres added to them would pass both
+  // magnitude tests — 85.31 is not a UTM easting, 85.31 + 432000 is — while
+  // destroying the coordinates. Degrees are excluded outright, which costs the
+  // rare small shifted plot that fits inside the lon/lat window and gains the
+  // guarantee that no import is made worse than it was.
+  const { win, widget } = await boot();
+  const ring = [[85.3096, 23.3441], [85.3196, 23.3441], [85.3196, 23.3541], [85.3096, 23.3541]];
+  const dxf = ['0', 'SECTION', '2', 'HEADER',
+    '9', '$INSBASE', '10', '432000', '20', '2618000', '30', '0',
+    '9', '$EXTMIN', '10', '85.3096', '20', '23.3441', '30', '0',
+    '0', 'ENDSEC', '0', 'SECTION', '2', 'ENTITIES',
+    '0', 'LWPOLYLINE', '8', 'P', '70', '1']
+    .concat(...ring.map((p) => ['10', String(p[0]), '20', String(p[1])]))
+    .concat(['0', 'ENDSEC', '0', 'EOF']).join('\r\n');
+
+  // Named as lon/lat, so the session's UTM zone is reached by projection —
+  // the path the origin shift must not hijack.
+  setSelect(win, q(widget, '#impCrs'), '4326');
+  await settle(2);
+  feedNextFilePicker(win, 'degrees.dxf', dxf);
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iDxf'));
+  await settle(16);
+
+  const s = sessionOrEmpty(win);
+  assert.strictEqual(s.shapes.length, 1, 'the DXF must import');
+  const C = require('../lib/crs.js');
+  const want = C.reprojectRing(ring, C.parseEpsg('4326'), C.parseEpsg('32645'));
+  assert.ok(Math.abs(s.shapes[0].points[0][0] - want.points[0][0]) < 0.5,
+    `degrees must be projected, not shifted: expected ${want.points[0]}, got ${s.shapes[0].points[0]}`);
+});
+
 t('a DXF with genuinely local coordinates and no recorded origin still imports', async () => {
   // Nothing in the file says where it belongs, so nothing is invented: it
   // imports exactly as it always did. Only the automatic view move is held

@@ -1922,6 +1922,16 @@
     if (crs.kind !== 'utm') return null;
     if (asWritten.family === 'utm' || withOrigin.family !== 'utm') return null;
 
+    // Degrees are never shifted. A DXF CAN hold lon/lat, and an origin in
+    // metres added to it would pass the two tests above while destroying the
+    // coordinates — 85.31 + 432000 is not a place. This costs the one case
+    // where a shifted drawing is small enough to fit inside the lon/lat window
+    // (a plot under 180 x 90 units sitting low in its kilometre square): it
+    // imports as it did before, with the $INSBASE warning still naming the
+    // origin. Declining leaves the coordinates as they were; applying wrongly
+    // would not, and only one of those is recoverable.
+    if (asWritten.family === 'geographic') return null;
+
     return {
       origin,
       rings: result.rings.map((r) => Object.assign({}, r, {
@@ -1957,7 +1967,7 @@
         // detectCrs offers sixty candidates rather than picking one. The
         // import is HELD rather than thrown away: the operator names the
         // system and it proceeds, instead of having to find the file again.
-        st.crsAsk = { result, opts: o, epsg: '', note: crsCheck.note || null };
+        st.crsAsk = { result, opts: o, epsg: '' };
         renderWidget();
         toast(crsCheck.error, 'warn', 12000);
         return false;
@@ -4322,9 +4332,7 @@ table.coord td:first-child{width:52px}
     const n = a.result.rings.length;
     return `<div class="card" id="crsAsk">
       <h4>Which coordinate system is this file in?</h4>
-      <div class="dim">${a.note
-        ? esc(a.note)
-        : `${n} parcel(s) were read from ${esc(a.opts.what || 'the file')}${a.opts.name ? ` (${esc(a.opts.name)})` : ''}, but neither the file nor this session says what system the numbers are in. A wrong choice puts them hundreds of kilometres out, so it is asked rather than guessed.`}</div>
+      <div class="dim">${n} parcel(s) were read from ${esc(a.opts.what || 'the file')}${a.opts.name ? ` (${esc(a.opts.name)})` : ''}, but neither the file nor this session says what system the numbers are in. A wrong choice puts them hundreds of kilometres out, so it is asked rather than guessed.</div>
       <div class="field" style="margin-top:6px"><span>Coordinates are in</span>
         <select id="crsAskPick">
           <option value="">— choose —</option>
