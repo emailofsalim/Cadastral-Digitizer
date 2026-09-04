@@ -26,7 +26,7 @@
   'use strict';
 
   /* Developed by Md Salim Ansari. MIT licensed — see LICENSE. */
-  const VERSION = '17.2.0';
+  const VERSION = '17.3.0';
   const WIDGET_ID = 'bnd15-widget';
   const STYLE_ID = 'bnd15-style';
   const OVERLAY_ID = 'bnd15-overlay';
