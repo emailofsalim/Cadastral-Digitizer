@@ -890,9 +890,11 @@ test('R17u: a leak reading is dropped once the geometry it described has moved',
 /* =====================================================================
  * R18 — THE v17 UPGRADE BRIEF
  * ---------------------------------------------------------------------
- * One assertion per section of BhuNaksha_Digitizer_Final_Upgrade_Instructions
- * as adjusted in UPGRADE_INSTRUCTIONS_ADJUSTED.md, so a capability added for
- * that brief cannot quietly disappear again.
+ * One assertion per section of the v17 upgrade brief as adjusted in
+ * UPGRADE_INSTRUCTIONS_ADJUSTED.md, so a capability added for that brief
+ * cannot quietly disappear again. The brief itself is no longer in the working
+ * tree; it is in history at b34b065, and the adjusted document is what these
+ * assertions actually track.
  * =================================================================== */
 
 const Imp = require('../lib/importers.js');
