@@ -26,7 +26,7 @@
   'use strict';
 
   /* Developed by Md Salim Ansari. MIT licensed — see LICENSE. */
-  const VERSION = '17.3.1';
+  const VERSION = '17.3.2';
   const WIDGET_ID = 'bnd15-widget';
   const STYLE_ID = 'bnd15-style';
   const OVERLAY_ID = 'bnd15-overlay';
@@ -241,6 +241,10 @@
     // Which of the three main menus is open, if any (brief §1).
     openMenu: null,              // 'import' | 'export' | null
     importSummary: null,         // what the last import brought in
+    // Parcels hidden from the overlay. DISPLAY ONLY: ids live here rather than
+    // on the shapes, so no geometry, attribute or project field is touched and
+    // the saved project format is exactly what it was.
+    hiddenShapeIds: [],
   };
 
   /* A pristine copy of the runtime state, taken before anything has run.
@@ -795,6 +799,34 @@
     return [(client[0] - r.left) * dpr, (client[1] - r.top) * dpr];
   }
 
+  /* =====================================================================
+   * PARCEL VISIBILITY  — display only
+   * ---------------------------------------------------------------------
+   * Hiding a parcel removes it from the overlay and nothing else. The shape
+   * stays in st.shapes with its geometry, vertices, attributes, area and id
+   * untouched, keeps its place in the list, and is still exported: this is a
+   * view control, not a filter and certainly not a delete.
+   *
+   * The ids are kept in state rather than as a flag on each shape so that the
+   * saved project format is unchanged, and so a hidden parcel cannot become a
+   * hidden parcel in someone else's copy of the file.
+   * =================================================================== */
+  const isHidden = (id) => st.hiddenShapeIds.indexOf(id) >= 0;
+
+  function toggleShapeVisibility(id) {
+    const i = st.hiddenShapeIds.indexOf(id);
+    if (i >= 0) st.hiddenShapeIds.splice(i, 1);
+    else st.hiddenShapeIds.push(id);
+    // No commit(): showing and hiding is not an edit, so it does not belong in
+    // undo and must not be able to bury a real change.
+    renderWidget(); draw();
+  }
+
+  function setAllShapesHidden(hide) {
+    st.hiddenShapeIds = hide ? st.shapes.map((s) => s.id) : [];
+    renderWidget(); draw();
+  }
+
   function draw() {
     const ov = document.getElementById(OVERLAY_ID);
     if (!ov) return;
@@ -804,6 +836,9 @@
     const dpr = ov.width / (r.width || 1);
 
     for (const shape of st.shapes) {
+      // Hidden is drawn-or-not, and nothing more. The shape is still in the
+      // collection, still selectable from the list, still exported.
+      if (isHidden(shape.id)) continue;
       const editing = st.editShapeId === shape.id;
       const selected = st.selectedShapeId === shape.id;
       const pts = shape.points.map(toOverlayPx).filter(Boolean);
@@ -1929,7 +1964,53 @@
       }
     }
     if (!isFinite(minX)) return;
-    safe(() => { if (isFn(A.setCenter)) A.setCenter([(minX + maxX) / 2, (minY + maxY) / 2]); });
+    const target = [(minX + maxX) / 2, (minY + maxY) / 2];
+
+    /* ------------------------------------------------------------------
+     * WHY THIS IS GUARDED — the blank-background report.
+     *
+     * This used to call setCenter unconditionally. A DXF routinely carries
+     * LOCAL CAD coordinates: a site datum, or numbers a few hundred units from
+     * an arbitrary origin. Read as eastings and northings, (250, 250) in UTM
+     * 45N is a point on the equator off West Africa — so the portal dutifully
+     * panned there, found no cadastral tiles, and the operator was left looking
+     * at a blank map with their parcels nowhere in sight.
+     *
+     * The import itself was fine. Only the automatic camera move was wrong, so
+     * only the camera move is conditional: the parcels are adopted, overlaid
+     * and exported exactly as before either way. Nothing about the parser,
+     * the geometry or the coordinates is touched.
+     *
+     * Plausibility is decided with the application's OWN CRS engine — there is
+     * no second projection code and no list of sites or countries here.
+     * ------------------------------------------------------------------ */
+    const crs = sessionCrs();
+    const check = crs ? safe(() => Crs.validateAgainstRegion([target], crs), null) : null;
+    if (check && !check.ok) {
+      // Cannot be expressed as a real place at all: moving there would strand
+      // the view somewhere that does not exist.
+      toast('The imported parcels are overlaid, but the view was left where it is: their coordinates do not resolve to a real location in this coordinate system.', 'warn', 12000);
+      return;
+    }
+
+    // In range, but is it anywhere near where the operator is working? A file
+    // in local CAD units converts to a perfectly valid latitude and longitude
+    // that happens to be thousands of kilometres away. Rather than pan into
+    // empty tiles, the view is kept and the operator is told where the numbers
+    // actually landed — which is the information needed to fix the CRS.
+    const here = crs && isFn(A.getCenter) ? safe(() => A.getCenter(), null) : null;
+    const hereLl = here && check ? safe(() => Crs.toWgs84(here[0], here[1], crs), null) : null;
+    if (hereLl && check && isFinite(check.lon) && isFinite(check.lat)) {
+      const dLat = (check.lat - hereLl[1]) * 111;
+      const dLon = (check.lon - hereLl[0]) * 111 * Math.cos(hereLl[1] * Math.PI / 180);
+      // Generous on purpose: a cadastral import is within a district, and a
+      // legitimate one must never be refused a view move by this guard.
+      if (Math.hypot(dLat, dLon) > 2000) {
+        toast(`The parcels are overlaid, but ${check.centroidText} is a long way from the map you are on, so the view was left where it is. That usually means the file is in local drawing coordinates rather than the session's coordinate system.`, 'warn', 14000);
+        return;
+      }
+    }
+    safe(() => { if (isFn(A.setCenter)) A.setCenter(target); });
   }
 
   /* Pick several files at once. A shapefile is a multi-file dataset, so this
@@ -3816,13 +3897,15 @@ table.coord td:first-child{width:52px}
       }
       const shifted = s.shift && !GeomEdit.isIdentityShift(s.shift)
         ? GeomEdit.describeShift(s.shift, st.backups[s.id] || s.points) : null;
-      return `<div class="item ${bad ? 'bad' : ''} ${st.selectedShapeId === s.id ? 'sel' : ''}">
+      const hidden = isHidden(s.id);
+      return `<div class="item ${bad ? 'bad' : ''} ${st.selectedShapeId === s.id ? 'sel' : ''}" data-row="${s.id}">
         <span class="grow">${label} · ${s.points.length}v · ${(s.areaM2 || 0).toFixed(0)} ${areaUnit()}${cmp}
           ${s.source === 'imported' ? ` <span class="pill imp" title="Imported from ${esc(s.layer || 'a file')} — edited, cleaned and exported exactly like a traced parcel">${esc(s.layer || 'imported')}</span>` : ''}
           ${s.lastGcpCorrection ? ' <span class="pill ok">GCP</span>' : ''}
           ${shifted ? ` <span class="pill warn" title="${esc(shifted.summary)} — stored separately and resettable">shifted</span>` : ''}
           ${bad ? ` <span class="pill bad" title="${esc(s.validity.problems.map((p) => p.message).join(' '))}">geometry</span>` : ''}
         </span>
+        <button data-vis="${s.id}" title="${hidden ? 'Hidden — click to show this parcel again. Nothing was deleted.' : 'Hide this parcel from the map. It stays in the project, keeps its geometry and is still exported.'}">${hidden ? '🚫' : '👁'}</button>
         <button data-sel="${s.id}" title="Make this the parcel the Edit tools act on">${st.selectedShapeId === s.id ? '◉' : '○'}</button>
         <button data-edit="${s.id}">${editing ? 'Done' : 'Edit'}</button>
         <button data-reg="${s.id}" title="Regularise just this shape">📐</button>
@@ -3831,7 +3914,9 @@ table.coord td:first-child{width:52px}
       </div>`;
     }).join('');
     const layers = [...new Set(st.shapes.map((s) => s.layer || 'Digitized'))];
-    return `<div class="card"><h4>Shapes <span class="pill">${st.shapes.length}</span></h4>
+    const anyVisible = st.shapes.some((s) => !isHidden(s.id));
+    return `<div class="card"><h4>Shapes <span class="pill">${st.shapes.length}</span>
+      <button class="bnd15-btn sm gray" id="visAll" style="float:right;padding:2px 8px;font-size:10.5px" title="${anyVisible ? 'Hide every parcel from the map. Nothing is deleted and nothing is changed.' : 'Show every parcel again.'}">${anyVisible ? '🚫 Hide all' : '👁 Show all'}</button></h4>
       ${layers.length > 1 ? `<div class="dim" style="font-size:10.5px;margin-bottom:4px">Layers: ${layers.map((l) => esc(l)).join(' · ')}</div>` : ''}
       <div class="list">${items}</div></div>`;
   }
@@ -4564,7 +4649,44 @@ table.coord td:first-child{width:52px}
       </div>`;
 
     wire(body);
+    focusSelectedRow(body);
     draw();
+  }
+
+  /* =====================================================================
+   * AUTO-FOCUS the selected parcel's row
+   * ---------------------------------------------------------------------
+   * With five hundred parcels the list is a 150 px window onto a very long
+   * column, and selecting a plot on the map left its row wherever it happened
+   * to be. This scrolls it into view.
+   *
+   * Deliberately NOT scrollIntoView(): that walks up the ancestor chain and
+   * will scroll the host page — the portal's own map — out from under the
+   * operator. Only the list's own scrollTop is touched.
+   *
+   * It fires only when the selection actually CHANGES, so scrolling the list
+   * by hand is never fought, and it sets no DOM focus, so typing in a field is
+   * never interrupted. The shape's own id is the anchor; nothing is reordered,
+   * re-sorted or moved to the top, and the collection itself is untouched.
+   * =================================================================== */
+  let lastFocusedShapeId = null;
+  function focusSelectedRow(body) {
+    const id = st.selectedShapeId;
+    if (id == null) { lastFocusedShapeId = null; return; }
+    if (id === lastFocusedShapeId) return;
+    const row = body.querySelector(`.list [data-row="${id}"]`);
+    const list = row && row.parentNode;
+    if (!row || !list || typeof list.scrollTop !== 'number') return;
+    lastFocusedShapeId = id;
+
+    // Only when it is actually out of view, and only far enough to bring it in
+    // — a row already visible is left exactly where it is.
+    const top = row.offsetTop - list.offsetTop;
+    const bottom = top + row.offsetHeight;
+    const viewTop = list.scrollTop;
+    const viewBottom = viewTop + list.clientHeight;
+    if (top < viewTop) list.scrollTop = top;
+    else if (bottom > viewBottom) list.scrollTop = bottom - list.clientHeight;
   }
 
   function wire(body) {
@@ -4692,6 +4814,8 @@ table.coord td:first-child{width:52px}
       if (st.editShapeId === id) { st.editShapeId = null; st.mode = 'idle'; }
       recomputeFit(); autosave(); draw(); renderWidget();
     });
+    body.querySelectorAll('[data-vis]').forEach((b) => b.onclick = () => toggleShapeVisibility(+b.dataset.vis));
+    on('visAll', 'onclick', () => setAllShapesHidden(st.shapes.some((sh) => !isHidden(sh.id))));
     body.querySelectorAll('[data-revert]').forEach((b) => b.onclick = () => revertShape(+b.dataset.revert));
     body.querySelectorAll('[data-reg]').forEach((b) => b.onclick = () => regulariseShapes([+b.dataset.reg]));
 

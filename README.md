@@ -1,4 +1,4 @@
-# Cadastral Digitizer — v17.3.1
+# Cadastral Digitizer — v17.3.2
 
 **Developed by Md Salim Ansari** · MIT licence (see [LICENSE](LICENSE))
 
@@ -9,10 +9,10 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
 **Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store. Submission answers — single purpose, permission justifications, data-usage declarations and a privacy policy — are drafted in [docs/chrome-web-store.md](docs/chrome-web-store.md).
-**Tests:** `npm test` — 613 tests. No install needed: 524 run immediately, and 89 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 622 tests. No install needed: 524 run immediately, and 98 that need a browser skip cleanly. To enable those:
 
 ```bash
-npm install --no-save jsdom            # 69 DOM integration tests
+npm install --no-save jsdom            # 78 DOM integration tests
 npm install --no-save playwright-core  # 20 real-Chrome E2E tests (needs a Chrome binary)
 ```
 
@@ -61,6 +61,8 @@ Imported rings become **ordinary shapes**. Not a separate layer type with its ow
 
 **They are overlaid automatically.** Coordinates in the file are used as they are, so a DXF holding real eastings and northings lands where those eastings and northings are, and the *view* moves to the imported extent — never the geometry to the view.
 
+**The view moves only where there is something to look at.** A DXF routinely carries *local drawing* coordinates — a site datum a few hundred units from an arbitrary origin. Read as eastings and northings, `(250, 250)` in UTM 45N is a point on the equator off West Africa, and the import used to pan there: no tiles, blank map, parcels nowhere in sight. The parcels always imported correctly; only the camera was wrong. Now the target is checked against the session's coordinate system with the *existing* CRS engine, and where it does not name a plausible place the view stays put and says why — which is the information you need to fix the CRS.
+
 **The coordinate system is converted when it is known, and asked for when it is not.** See below — this is the distinction the whole import path turns on.
 
 **Unsupported content is skipped with a reason.** A cadastral KMZ routinely carries ground overlays, network links and 3D models; a DXF carries circles and splines with no vertex list. Refusing the whole file over one unreadable placemark is the wrong trade when the other forty parcels are good, so each is counted and named.
@@ -79,6 +81,18 @@ What it does with what it finds:
 - **The CRS is read from `.prj`, or asked for.** An EPSG code is recovered and handed to the *existing* CRS engine — there is no second projection code. Where the `.prj` is missing or names something unrecognised, the coordinates are left exactly as they are and the panel asks which system they are in. **It never assumes WGS 84**, which on a cadastral parcel would be a silent error of hundreds of kilometres.
 
 Imported parcels are ordinary shapes, so editing, snapping, area, quality checks and every export work on them with no code of their own.
+
+### Showing and hiding parcels
+
+Every parcel row carries an **eye**, and the Shapes header carries **Hide all / Show all**.
+
+Hiding is **display only** — the parcel keeps its geometry, vertices, attributes, area, id and its place in the list, and is **still exported**. The hidden ids live in session state rather than on the shapes, so the saved project format is exactly what it was and a parcel cannot arrive hidden in someone else's copy of the file. It is a view control, not a filter and certainly not a delete.
+
+### The selected parcel scrolls into view
+
+With five hundred parcels the list is a 150 px window onto a very long column. Selecting a plot now scrolls its row into view.
+
+Deliberately **not** `scrollIntoView()`, which walks up the ancestor chain and would scroll the portal's own map out from under you — only the list's own scroll position moves. It fires just when the selection changes, so scrolling by hand is never fought; it takes no keyboard focus, so typing is never interrupted; and it finds the row by the shape's id. Nothing is sorted, reordered or moved to the top.
 
 ### Hard Reset
 
@@ -465,7 +479,7 @@ lib/geom_edit.js       move/rotate/scale, the shift record, RF + scale-bar calib
 lib/shapefile.js       ESRI Shapefile reader — .shp / .dbf / .prj, and the ZIP
 vendor/                PDF.js, vendored verbatim (Apache-2.0) — the only third-party
                        code shipped; injected on demand, never fetched
-test/                  613 tests — npm test
+test/                  622 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```
@@ -504,13 +518,13 @@ Everything in `lib/` is pure — no DOM, no map object — so the code the exten
 
 **A note on settings.** Two settings were found carrying their weight in name only. `showValidityWarnings` had no control and nothing read it — it promised control over behaviour that did not exist, so it is gone; flagging a self-intersecting ring is a correctness signal and not the sort of thing a checkbox should be able to silence. `bboxLeakWarnPct` was likewise dead, but the check it named turned out to be worth building, so it now does what it always claimed. A test asserts that every setting is both read by the code and reachable from the panel, or else appears on a short list of deliberate internals — so a setting cannot quietly become decoration again.
 
-**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 613 every time.
+**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 622 every time.
 
 ---
 
 ## What is verified, and what is not
 
-**Verified by test (613, run with `npm test`):**
+**Verified by test (622, run with `npm test`):**
 
 - **The extension installed in real Chrome.** `test/chrome_e2e.test.js` loads the actual unpacked extension into headless Chrome via Playwright and exercises the parts no simulation can reach:
   - `chrome.scripting.executeScript` with `world: 'MAIN'` really injecting the libraries into the page's own JS world, in the right order — checked by having the *page* look for them.
