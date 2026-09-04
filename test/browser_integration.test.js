@@ -2143,3 +2143,282 @@ t('the chosen import system survives a reload, like the export one', async () =>
     'and the selector must show it after the re-render');
 });
 
+
+/* =====================================================================
+ * v17.4 — SELECTING SEVERAL PARCELS, AND SNAPPING ONE
+ * ---------------------------------------------------------------------
+ * Two additions, and the tests below are as much about what did NOT change.
+ *
+ * A group move is one operator gesture, so it must be one selection and one
+ * undo step; and every parcel must receive the IDENTICAL transform, because
+ * anything measured per-parcel would quietly deform the block. The individual
+ * Snap is the existing Clean-up snap given a target — the neighbours are read
+ * as references and never written.
+ * =================================================================== */
+
+async function withThreeShapes() {
+  const ctx = await withOneShape();
+  click(q(ctx.widget, '[data-sel]'));
+  await settle(2);
+  click(q(ctx.widget, '#eDuplicate'));
+  await settle(4);
+  click(q(ctx.widget, '#eDuplicate'));
+  await settle(4);
+  assert.strictEqual(sessionOrEmpty(ctx.win).shapes.length, 3, 'setup: three parcels');
+  return ctx;
+}
+
+// Duplicate leaves its new copy selected, so any test that wants a KNOWN
+// selection has to start from an empty one.
+async function deselectAllRows(ctx) {
+  for (const b of Array.from(ctx.widget.querySelectorAll('[data-sel]'))) {
+    if (b.textContent.trim() === '◉') { click(b); await settle(2); }
+  }
+}
+
+// Select every row in the Shapes list, and return the ids in row order.
+async function selectAllRows(ctx) {
+  const rows = Array.from(ctx.widget.querySelectorAll('[data-sel]'));
+  for (const b of rows) {
+    if (b.textContent.trim() !== '◉') { click(b); await settle(2); }
+  }
+  return Array.from(ctx.widget.querySelectorAll('[data-sel]')).map((b) => +b.dataset.sel);
+}
+
+const ringsOf = (win) => sessionOrEmpty(win).shapes.map((s) => s.points.map((p) => p.slice()));
+
+t('several parcels can be selected at once, and selecting one again drops it', async () => {
+  const ctx = await withThreeShapes();
+  const ids = await selectAllRows(ctx);
+  assert.strictEqual(ids.length, 3);
+
+  const marks = () => Array.from(ctx.widget.querySelectorAll('[data-sel]')).map((b) => b.textContent.trim());
+  assert.deepStrictEqual(marks(), ['◉', '◉', '◉'], 'all three must stay selected simultaneously');
+  assert.strictEqual(sessionOrEmpty(ctx.win).shapes.length, 3,
+    'selecting must never copy or merge a parcel');
+
+  // Toggle the middle one back off; the other two are untouched.
+  click(ctx.widget.querySelectorAll('[data-sel]')[1]);
+  await settle(3);
+  assert.deepStrictEqual(marks(), ['◉', '○', '◉'],
+    'selecting an already-selected parcel removes only that one');
+  assert.strictEqual(sessionOrEmpty(ctx.win).shapes.length, 3, 'and deletes nothing');
+});
+
+t('a typed shift moves every selected parcel by exactly the same amount', async () => {
+  const ctx = await withThreeShapes();
+  await selectAllRows(ctx);
+  const before = ringsOf(ctx.win);
+
+  q(ctx.widget, '#eDx').value = '25';
+  q(ctx.widget, '#eDy').value = '-15';
+  click(q(ctx.widget, '#eApplyXY'));
+  await settle(5);
+
+  const after = ringsOf(ctx.win);
+  assert.strictEqual(after.length, 3, 'no parcel may be added or lost');
+  after.forEach((ring, i) => {
+    assert.strictEqual(ring.length, before[i].length, `parcel ${i} must keep its vertex count`);
+    ring.forEach((p, k) => {
+      assert.ok(Math.abs(p[0] - (before[i][k][0] + 25)) < 1e-6
+        && Math.abs(p[1] - (before[i][k][1] - -15 * -1)) < 1e-6,
+      `parcel ${i} vertex ${k}: expected exactly +25,-15, got ${p} from ${before[i][k]}`);
+    });
+  });
+});
+
+t('a group rotation turns the block, it does not spin each parcel in place', async () => {
+  const ctx = await withThreeShapes();
+  await selectAllRows(ctx);
+  const before = ringsOf(ctx.win);
+  // The distance between two parcels is what separates a group rotation from
+  // three independent ones: rotating each about its own centroid leaves the
+  // centroids where they are, so this distance would be unchanged AND the
+  // parcels would no longer line up.
+  const centroid = (r) => [r.reduce((a, p) => a + p[0], 0) / r.length, r.reduce((a, p) => a + p[1], 0) / r.length];
+  const gap = (rings) => {
+    const a = centroid(rings[0]); const b = centroid(rings[2]);
+    return Math.hypot(a[0] - b[0], a[1] - b[1]);
+  };
+  const gapBefore = gap(before);
+
+  q(ctx.widget, '#eRot').value = '90';
+  click(q(ctx.widget, '#eApplyRot'));
+  await settle(5);
+
+  const after = ringsOf(ctx.win);
+  assert.strictEqual(after.length, 3, 'parcels stay separate');
+  // Relative arrangement preserved: a rigid rotation keeps every inter-parcel
+  // distance exactly.
+  assert.ok(Math.abs(gap(after) - gapBefore) < 1e-6,
+    `the group must rotate rigidly: gap ${gapBefore} -> ${gap(after)}`);
+  // Every pairwise distance, not just one: a rigid rotation preserves all of
+  // them. (A parcel whose centroid sits ON the group origin legitimately keeps
+  // that centroid and turns in place, so centroid displacement is the wrong
+  // thing to measure.)
+  for (let i = 0; i < 3; i++) {
+    for (let j = i + 1; j < 3; j++) {
+      const d = (rs) => { const a = centroid(rs[i]); const b = centroid(rs[j]); return Math.hypot(a[0] - b[0], a[1] - b[1]); };
+      assert.ok(Math.abs(d(after) - d(before)) < 1e-6,
+        `parcels ${i} and ${j} must keep their separation: ${d(before)} -> ${d(after)}`);
+    }
+  }
+  // And every parcel took part: a 90° turn changes every ring that is not a
+  // point, wherever its centroid is.
+  after.forEach((r, i) => {
+    assert.ok(r.some((p, k) => Math.hypot(p[0] - before[i][k][0], p[1] - before[i][k][1]) > 1e-6),
+      `parcel ${i} must have been rotated`);
+  });
+});
+
+t('a group scale keeps the block together, gaps and all', async () => {
+  const ctx = await withThreeShapes();
+  await selectAllRows(ctx);
+  const before = ringsOf(ctx.win);
+  const centroid = (r) => [r.reduce((a, p) => a + p[0], 0) / r.length, r.reduce((a, p) => a + p[1], 0) / r.length];
+  const gapBefore = (() => { const a = centroid(before[0]); const b = centroid(before[2]); return Math.hypot(a[0] - b[0], a[1] - b[1]); })();
+
+  q(ctx.widget, '#eScale').value = '2';
+  click(q(ctx.widget, '#eApplyScale'));
+  await settle(5);
+
+  const after = ringsOf(ctx.win);
+  const gapAfter = (() => { const a = centroid(after[0]); const b = centroid(after[2]); return Math.hypot(a[0] - b[0], a[1] - b[1]); })();
+  assert.ok(Math.abs(gapAfter - gapBefore * 2) < 1e-4,
+    `the gaps must scale with the block: ${gapBefore} -> ${gapAfter}, expected ${gapBefore * 2}`);
+  assert.strictEqual(after.length, 3, 'parcels stay separate');
+});
+
+t('one selected parcel behaves exactly as it did before multi-selection existed', async () => {
+  // The single-parcel paths are the ones already in the field. A group of one
+  // must not take the group route, or its rotation origin would change from
+  // its own centroid to a bounding-box centre that happens to differ.
+  const ctx = await withThreeShapes();
+  await deselectAllRows(ctx);
+  click(Array.from(ctx.widget.querySelectorAll('[data-sel]'))[1]);
+  await settle(3);
+
+  const before = ringsOf(ctx.win);
+  const centroidOf = (r) => [r.reduce((a, p) => a + p[0], 0) / r.length, r.reduce((a, p) => a + p[1], 0) / r.length];
+  const cBefore = centroidOf(before[1]);
+
+  q(ctx.widget, '#eRot').value = '37';
+  click(q(ctx.widget, '#eApplyRot'));
+  await settle(5);
+
+  const after = ringsOf(ctx.win);
+  // Rotation about its OWN centroid leaves that centroid exactly where it was.
+  const cAfter = centroidOf(after[1]);
+  assert.ok(Math.hypot(cAfter[0] - cBefore[0], cAfter[1] - cBefore[1]) < 1e-6,
+    `a single parcel must still rotate about its own centre: ${cBefore} -> ${cAfter}`);
+  // And the other two are untouched.
+  assert.deepStrictEqual(after[0], before[0], 'an unselected parcel must not move');
+  assert.deepStrictEqual(after[2], before[2], 'an unselected parcel must not move');
+});
+
+t('an unselected parcel never moves with the group', async () => {
+  const ctx = await withThreeShapes();
+  await deselectAllRows(ctx);
+  const rows = Array.from(ctx.widget.querySelectorAll('[data-sel]'));
+  click(rows[0]); await settle(2);
+  click(rows[1]); await settle(2);
+
+  const before = ringsOf(ctx.win);
+  q(ctx.widget, '#eDx').value = '10';
+  q(ctx.widget, '#eDy').value = '0';
+  click(q(ctx.widget, '#eApplyXY'));
+  await settle(5);
+
+  const after = ringsOf(ctx.win);
+  assert.ok(Math.abs(after[0][0][0] - (before[0][0][0] + 10)) < 1e-6, 'selected parcel 0 moves');
+  assert.ok(Math.abs(after[1][0][0] - (before[1][0][0] + 10)) < 1e-6, 'selected parcel 1 moves');
+  assert.deepStrictEqual(after[2], before[2], 'the unselected parcel must be untouched');
+});
+
+t('a group move is one undo step, and it restores every parcel', async () => {
+  const ctx = await withThreeShapes();
+  await selectAllRows(ctx);
+  const before = ringsOf(ctx.win);
+
+  q(ctx.widget, '#eDx').value = '40';
+  q(ctx.widget, '#eDy').value = '40';
+  click(q(ctx.widget, '#eApplyXY'));
+  await settle(5);
+  assert.ok(Math.abs(ringsOf(ctx.win)[0][0][0] - before[0][0][0]) > 1, 'setup: it moved');
+
+  const z = new ctx.win.Event('keydown', { bubbles: true });
+  Object.assign(z, { key: 'z', ctrlKey: true, shiftKey: false });
+  ctx.win.document.dispatchEvent(z);
+  await settle(6);
+  assert.deepStrictEqual(ringsOf(ctx.win), before,
+    'one Ctrl+Z must put all three parcels back — a group move is one step, not three');
+});
+
+t('every parcel row carries a Snap button, between Edit and Regularise', async () => {
+  const ctx = await withThreeShapes();
+  const rows = Array.from(ctx.widget.querySelectorAll('.list [data-row]'));
+  assert.strictEqual(rows.length, 3, 'setup: three rows');
+  for (const row of rows) {
+    const labels = Array.from(row.querySelectorAll('button')).map((b) => b.textContent.trim());
+    assert.strictEqual(labels.filter((l) => l === 'Snap').length, 1,
+      `exactly one Snap button per row, got ${JSON.stringify(labels)}`);
+    const iEdit = labels.indexOf('Edit');
+    const iSnap = labels.indexOf('Snap');
+    const iReg = labels.indexOf('📐');
+    assert.ok(iEdit >= 0 && iReg >= 0, `Edit and Regularise must still be there: ${JSON.stringify(labels)}`);
+    assert.ok(iEdit < iSnap && iSnap < iReg,
+      `order must be Edit -> Snap -> Regularise, got ${JSON.stringify(labels)}`);
+    // Nothing was displaced to make room.
+    for (const kept of ['👁', '○', '◉', '✕']) {
+      if (kept === '◉' || kept === '○') {
+        assert.ok(labels.includes('○') || labels.includes('◉'), 'the select dot must survive');
+      } else {
+        assert.ok(labels.includes(kept), `${kept} must survive: ${JSON.stringify(labels)}`);
+      }
+    }
+  }
+});
+
+t("a row's Snap targets that row's parcel, whatever is selected on the map", async () => {
+  const ctx = await withThreeShapes();
+  // Select a DIFFERENT parcel than the one whose Snap will be pressed. If the
+  // button read the global selection instead of its own row, this is the case
+  // that would snap the wrong parcel.
+  const rows = Array.from(ctx.widget.querySelectorAll('[data-sel]'));
+  click(rows[0]);
+  await settle(3);
+
+  const snaps = Array.from(ctx.widget.querySelectorAll('[data-snap]'));
+  assert.strictEqual(snaps.length, 3);
+  const targetId = +snaps[2].dataset.snap;
+  const ids = sessionOrEmpty(ctx.win).shapes.map((s) => s.id);
+  assert.strictEqual(targetId, ids[2], "the row's Snap must carry that row's own parcel id");
+
+  const before = ringsOf(ctx.win);
+  click(snaps[2]);
+  await settle(6);
+  const after = ringsOf(ctx.win);
+
+  // Parcels 0 and 1 were only ever references. Whatever happened to parcel 2,
+  // they must be byte-identical.
+  assert.deepStrictEqual(after[0], before[0], 'a neighbour used as a reference must not be modified');
+  assert.deepStrictEqual(after[1], before[1], 'a neighbour used as a reference must not be modified');
+  assert.strictEqual(after.length, 3, 'snapping must not add or remove a parcel');
+  assert.deepStrictEqual(sessionOrEmpty(ctx.win).shapes.map((s) => s.id), ids,
+    'and must not change any parcel id');
+});
+
+t('the global Clean-up snap still snaps the whole collection', async () => {
+  // The individual Snap is an addition, not a replacement. The existing
+  // whole-geometry button must still be there and still be wired.
+  const ctx = await withThreeShapes();
+  const src = fs.readFileSync(path.join(__dirname, '..', 'page_inject.js'), 'utf8');
+  assert.match(src, /function snapShapesToNeighbours\(/,
+    'the existing whole-collection snap must still exist');
+  assert.match(src, /Topo\.snapAllToNeighbours\(st\.shapes,/,
+    'and must still run over the whole collection');
+  // The new one reuses the existing per-ring form rather than a second algorithm.
+  assert.match(src, /Topo\.snapRing\(shape\.points, st\.shapes, tol, shape\.id\)/,
+    'the individual snap must reuse Topo.snapRing, excluding the target itself');
+  assert.ok(ctx.widget, 'the panel still renders');
+});

@@ -1,4 +1,4 @@
-# Cadastral Digitizer — v17.3.4
+# Cadastral Digitizer — v17.4.0
 
 **Developed by Md Salim Ansari** · MIT licence (see [LICENSE](LICENSE))
 
@@ -9,7 +9,7 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
 **Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store. Submission answers — single purpose, permission justifications, data-usage declarations and a privacy policy — are drafted in [docs/chrome-web-store.md](docs/chrome-web-store.md).
-**Tests:** `npm test` — 631 tests. No install needed: 527 run immediately, and 104 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 641 tests. No install needed: 527 run immediately, and 114 that need a browser skip cleanly. To enable those:
 
 ```bash
 npm install --no-save jsdom            # 80 DOM integration tests
@@ -270,6 +270,16 @@ Per-point controls: 🔍 zooms to it, `on`/`off` includes or excludes without de
 
 Control points correct **positional drift** — the portal drawing parcels away from where they really are. If the portal's geometry is already in the right place, tracing and exporting is the whole job, and the panel's workflow guide marks this step **optional** rather than implying every job needs georeferencing.
 
+### Several parcels at once
+
+Selecting a parcel **adds** it to the selection; selecting it again takes it back out. Nothing is copied and nothing is merged — three selected parcels are three independent geometries that happen to be spoken to together.
+
+**Shift X/Y, Rotate and Scale then act on all of them.** The distinction that matters is *one* transform, not one per parcel: a single delta is computed and applied to every member, and rotation and scaling use one common origin — the centre of the selection's bounding box, chosen over a centroid because it does not depend on which parcel was clicked first. So the block turns and resizes as a rigid arrangement, and relative spacing, individual shape, size and orientation are preserved **by construction** rather than checked for afterwards. Rotating each parcel about its own centre instead would spin them in place and quietly destroy the layout, which is exactly the bug this design forecloses.
+
+Dragging works the same way: dragging a parcel that is already selected moves the whole selection by one pointer delta; dragging one that is not selects just it, so a stale selection from ten minutes ago cannot be moved by accident. The whole group move is **one undo step**.
+
+With exactly one parcel selected, every path is the one that was there before — the same function, the same undo label, the same message. Vertex editing, Copy, Duplicate and Delete stay deliberately single-target and act on the last parcel selected: they are not translations, and applying them to a group silently is how parcels get lost.
+
 ### Editing a corner *is* tagging a control point
 
 Every digitised vertex already carries a coordinate, whether it was traced, batch-vectorised or placed by hand. So dragging a corner in **Edit** mode to where it actually belongs makes exactly the same statement as the two-step pairing above: *the geometry says here, the truth is there.* That drag is now recorded as a control point automatically, using the corner's **pre-drag** position as the source.
@@ -408,6 +418,8 @@ Two problems that no amount of GCP correction fixes, because they are not georef
 
 **🧲 Snap shared edges** moves vertices that are nearly on a neighbour's boundary onto it exactly. Vertex-to-vertex coincidence is preferred over the nearer edge point, because exact coincidence is the only form of sharing that survives downstream. Snapping is also applied live while drawing and during batch tracing, where it matters most.
 
+**Or one parcel at a time.** Every row in the Shapes list carries its own **Snap**, between Edit and Regularise. Snapping the whole sheet is the right move when the block was traced in one sitting; it is the wrong one when thirty-seven parcels are already correct and the thirty-eighth was just redrawn. The row button is not a second algorithm — it is the same `Topo.snapPoint`, the same tolerance from Settings, the same vertices-before-edges preference, given a target. The parcel's own id is passed as the exclusion, so its neighbours are read as references and **none of them is written**: snapping Plot 1629 cannot move Plot 2011-B. The button is bound to the id printed in its own row, not to whatever is selected on the map, so pressing it never acts on a parcel you were only looking at.
+
 The panel reports overlapping pairs with an estimated overlap area — **labelled as a grid estimate**, not exact clipping. It is enough to find the problem, not to quote in a document.
 
 ## Quality report
@@ -483,7 +495,7 @@ lib/geom_edit.js       move/rotate/scale, the shift record, RF + scale-bar calib
 lib/shapefile.js       ESRI Shapefile reader — .shp / .dbf / .prj, and the ZIP
 vendor/                PDF.js, vendored verbatim (Apache-2.0) — the only third-party
                        code shipped; injected on demand, never fetched
-test/                  631 tests — npm test
+test/                  641 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```
