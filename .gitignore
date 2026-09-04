@@ -7,5 +7,11 @@ package-lock.json
 *.log
 .DS_Store
 
-# Store packages built by `npm run package`.
-dist/
+# Store packages built by `npm run package`. Build output is regenerable and
+# stays out of the repository — with one deliberate exception below: the exact
+# archive submitted to the Chrome Web Store, kept so the uploaded bytes can be
+# identified later. Each release that is worth keeping needs its own line here,
+# rather than tracking every rebuild: a zip does not delta-compress, so every
+# committed build adds its full size to history permanently.
+dist/*
+!dist/cadastral-digitizer-17.1.0.zip
