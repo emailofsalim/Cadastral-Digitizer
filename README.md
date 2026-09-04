@@ -1,4 +1,4 @@
-# Cadastral Digitizer — v17.4.0
+# Cadastral Digitizer — v17.5.0
 
 **Developed by Md Salim Ansari** · MIT licence (see [LICENSE](LICENSE))
 
@@ -9,7 +9,7 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
 **Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store. Submission answers — single purpose, permission justifications, data-usage declarations and a privacy policy — are drafted in [docs/chrome-web-store.md](docs/chrome-web-store.md).
-**Tests:** `npm test` — 641 tests. No install needed: 527 run immediately, and 114 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 664 tests. No install needed: 539 run immediately, and 125 that need a browser skip cleanly. To enable those:
 
 ```bash
 npm install --no-save jsdom            # 80 DOM integration tests
@@ -420,6 +420,29 @@ Two problems that no amount of GCP correction fixes, because they are not georef
 
 **Or one parcel at a time.** Every row in the Shapes list carries its own **Snap**, between Edit and Regularise. Snapping the whole sheet is the right move when the block was traced in one sitting; it is the wrong one when thirty-seven parcels are already correct and the thirty-eighth was just redrawn. The row button is not a second algorithm — it is the same `Topo.snapPoint`, the same tolerance from Settings, the same vertices-before-edges preference, given a target. The parcel's own id is passed as the exclusion, so its neighbours are read as references and **none of them is written**: snapping Plot 1629 cannot move Plot 2011-B. The button is bound to the id printed in its own row, not to whatever is selected on the map, so pressing it never acts on a parcel you were only looking at.
 
+### Automatic digitization on zoom
+
+**Off by default, and off means nothing runs** — no timer is armed, no pixel is read, no geometry is considered. That default is the feature's most important property, and turning it off again disarms the timer in the same breath rather than leaving one awake to decide to do nothing.
+
+Turned on, with a parcel selected and a colour picked: zoom into a boundary and that parcel's *visible* corners settle onto the picked colour's edge. Zoom somewhere else and that section settles too. This is progressive local refinement — the rest of the parcel is never touched, and the view is never retraced.
+
+**It only ever moves existing corners.** It cannot insert or delete one. That is the smallest geometry change that can express "the boundary is actually here", and it makes two classes of bug impossible rather than merely unlikely: the vertex count cannot grow however many times an area is inspected, and a parcel cannot be quietly rebuilt into something you did not draw.
+
+The evidence is a straight scan through the corner along its own boundary normal, classified with **the same `colorDistanceSq` the flood fill uses** and the tolerance from the existing slider — there is no second colour detector and no second idea of what "the same parcel" means. A refinement is offered only when that scan reads as one clean crossing:
+
+| Refused when | Because |
+|---|---|
+| the scan leaves the readable area | half the evidence is off screen; extrapolating is a confident wrong answer |
+| there is more than one colour change | a sliver, a road, a label or a neighbour is in the way, and which crossing is *the* boundary would be a guess |
+| either run is under 3 px | a speck of noise or an anti-aliased fringe is not an edge |
+| the corner is already within the settle distance | **nothing to do** — this is what makes re-analysing the same view a no-op |
+
+That last rule is the whole defence against a detect-modify-render-detect loop, and it is checked rather than argued: across 5,076 combinations of starting offset, tolerance, search radius and settle distance, the refinement converges in **one** iteration and never oscillates. 4,736 of those combinations were refused outright, which is the intended bias — *leave the geometry alone* always beats *make a possibly wrong correction*.
+
+What it writes is **ordinary geometry**: the same points array, under the same `commit()` the manual tools use, through the same `refreshShapeMetrics`. There is no automatic-geometry type, no second history and no lock — so Undo reverts it, Redo restores it, and Select, Move Vertex, Add Vertex, Delete Vertex, Shift, Rotate, Scale, Copy, Duplicate and Delete all work on it afterwards, because as far as the rest of the application is concerned nothing unusual happened. One local refinement is **one** undo step, and a pass that finds nothing commits nothing at all.
+
+Manual work has priority: a drag in progress, a half-drawn outline or an open dialog all stop it. It reads the map's own canvas rather than taking a screen capture — a panel that blinked every time the view settled would be intolerable — and where those pixels cannot be read, a cross-origin portal being the usual case, it simply does nothing. Browser security is never worked around. The panel says which precondition is unmet, because an automatic feature that silently does nothing is indistinguishable from a broken one.
+
 The panel reports overlapping pairs with an estimated overlap area — **labelled as a grid estimate**, not exact clipping. It is enough to find the problem, not to quote in a document.
 
 ## Quality report
@@ -495,7 +518,7 @@ lib/geom_edit.js       move/rotate/scale, the shift record, RF + scale-bar calib
 lib/shapefile.js       ESRI Shapefile reader — .shp / .dbf / .prj, and the ZIP
 vendor/                PDF.js, vendored verbatim (Apache-2.0) — the only third-party
                        code shipped; injected on demand, never fetched
-test/                  641 tests — npm test
+test/                  664 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```

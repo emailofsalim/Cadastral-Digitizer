@@ -584,3 +584,139 @@ test('border mode batch vectorisation splits on dark lines alone', () => {
   assert.strictEqual(res.regions.length, 4,
     `the cross should divide the sheet into 4 quadrants, got ${res.regions.length}`);
 });
+
+/* =====================================================================
+ * LOCAL EDGE REFINEMENT  (17.5)
+ * ---------------------------------------------------------------------
+ * The value of this function is in what it REFUSES. A cadastral view is full
+ * of things that look like a boundary and are not — labels, roads, the
+ * neighbouring parcel's own edge, an anti-aliased fringe — so most of these
+ * tests assert that no refinement is offered at all.
+ * =================================================================== */
+
+// A vertical boundary at x = edgeX: parcel colour to its left, other to its right.
+function halfPlane(w, h, edgeX, left, right) {
+  const r = makeRaster(w, h, right);
+  paintRect(r, 0, 0, edgeX, h, left);
+  return r;
+}
+
+const REF = { target: PARCEL, tolerance: 30, searchPx: 12, minRunPx: 3, settlePx: 1.5 };
+
+test('a vertex short of the boundary is offered exactly the offset to it', () => {
+  const r = halfPlane(60, 40, 30, PARCEL, OTHER);
+  // The vertex sits at x=24, six pixels inside the parcel. The boundary is the
+  // gap between x=29 (parcel) and x=30 (other), so its midpoint is x=29.5.
+  const res = T.refineEdgeAlongNormal(r, 24, 20, 1, 0, REF);
+  assert.strictEqual(res.ok, true, `should refine: ${res.reason}`);
+  assert.ok(Math.abs(res.offset - 5.5) < 1e-9, `expected +5.5, got ${res.offset}`);
+  assert.ok(Math.abs((24 + res.dx) - 29.5) < 1e-9, `should land on 29.5, got ${24 + res.dx}`);
+});
+
+test('the sign of the normal does not change the answer', () => {
+  // The scan runs both ways and requires one crossing, so an inward normal and
+  // an outward one describe the same boundary. That is why the caller does not
+  // have to know the ring's winding.
+  const r = halfPlane(60, 40, 30, PARCEL, OTHER);
+  const fwd = T.refineEdgeAlongNormal(r, 24, 20, 1, 0, REF);
+  const rev = T.refineEdgeAlongNormal(r, 24, 20, -1, 0, REF);
+  assert.strictEqual(fwd.ok, true);
+  assert.strictEqual(rev.ok, true);
+  assert.ok(Math.abs((24 + fwd.dx) - (24 + rev.dx)) < 1e-9,
+    `both normals must land on the same pixel: ${24 + fwd.dx} vs ${24 + rev.dx}`);
+});
+
+test('a vertex already on the boundary is left alone', () => {
+  // THE ANTI-OSCILLATION RULE. Without it, the same view analysed twice would
+  // move the vertex back and forth by half a pixel forever.
+  const r = halfPlane(60, 40, 30, PARCEL, OTHER);
+  const res = T.refineEdgeAlongNormal(r, 30, 20, 1, 0, REF);
+  assert.strictEqual(res.ok, false, 'a settled vertex must not be moved');
+  assert.strictEqual(res.settled, true);
+  assert.match(res.reason, /already on the boundary/);
+});
+
+test('refining twice is idempotent — the second pass finds nothing to do', () => {
+  // The property the loop guard actually depends on, asserted end to end.
+  const r = halfPlane(60, 40, 30, PARCEL, OTHER);
+  const first = T.refineEdgeAlongNormal(r, 24, 20, 1, 0, REF);
+  assert.strictEqual(first.ok, true);
+  const landed = 24 + first.dx;
+  const second = T.refineEdgeAlongNormal(r, landed, 20, 1, 0, REF);
+  assert.strictEqual(second.ok, false, 'the second pass must offer no further change');
+  assert.strictEqual(second.settled, true);
+});
+
+test('two colour changes along the scan are ambiguous, so nothing is offered', () => {
+  // A sliver of another parcel, or a road: which of the two edges is "the"
+  // boundary is a guess, and this function does not guess.
+  const r = makeRaster(60, 40, OTHER);
+  paintRect(r, 0, 0, 22, 40, PARCEL);
+  paintRect(r, 34, 0, 26, 40, PARCEL);   // parcel colour again on the far side
+  const res = T.refineEdgeAlongNormal(r, 28, 20, 1, 0, REF);
+  assert.strictEqual(res.ok, false);
+  assert.match(res.reason, /ambiguous/);
+});
+
+test('a one-pixel speck is not an edge', () => {
+  // minRunPx is what separates a boundary from noise and anti-aliasing.
+  const r = makeRaster(60, 40, PARCEL);
+  paintRect(r, 33, 0, 1, 40, OTHER);     // a single stray column near the end
+  const res = T.refineEdgeAlongNormal(r, 24, 20, 1, 0, { ...REF, searchPx: 10 });
+  assert.strictEqual(res.ok, false, 'a 1px run must not pass as a boundary');
+});
+
+test('no matching colour anywhere in range means no refinement', () => {
+  const r = makeRaster(60, 40, OTHER);
+  const res = T.refineEdgeAlongNormal(r, 30, 20, 1, 0, REF);
+  assert.strictEqual(res.ok, false);
+  assert.match(res.reason, /no matching colour/);
+});
+
+test('a scan that runs off the readable area is abandoned, not extrapolated', () => {
+  // Half the evidence is off screen; guessing from the visible half is exactly
+  // the kind of confident wrong answer this feature must never give.
+  const r = halfPlane(60, 40, 30, PARCEL, OTHER);
+  const res = T.refineEdgeAlongNormal(r, 3, 20, 1, 0, REF);
+  assert.strictEqual(res.ok, false);
+  assert.match(res.reason, /leaves the readable area/);
+});
+
+test('a correction can never exceed the search radius', () => {
+  // The search radius is the safety limit as well as the scan length: a vertex
+  // cannot be thrown across the parcel by one pass, whatever the pixels say.
+  for (const searchPx of [4, 8, 12, 25]) {
+    const r = halfPlane(200, 40, 100, PARCEL, OTHER);
+    for (let vx = 60; vx < 140; vx++) {
+      const res = T.refineEdgeAlongNormal(r, vx, 20, 1, 0, { ...REF, searchPx });
+      if (res.ok) {
+        assert.ok(Math.abs(res.offset) <= searchPx,
+          `offset ${res.offset} exceeded the ${searchPx}px search radius`);
+      }
+    }
+  }
+});
+
+test('no reference colour means no refinement', () => {
+  // The picked colour IS the evidence. Without it there is nothing to compare.
+  const r = halfPlane(60, 40, 30, PARCEL, OTHER);
+  const res = T.refineEdgeAlongNormal(r, 24, 20, 1, 0, { ...REF, target: null });
+  assert.strictEqual(res.ok, false);
+  assert.match(res.reason, /no reference colour/);
+});
+
+test('the vertex normal is perpendicular to the local boundary', () => {
+  const square = [[0, 0], [10, 0], [10, 10], [0, 10]];
+  // At vertex 1 the neighbours are (0,0) and (10,10); the chord runs diagonally,
+  // so the normal is the other diagonal.
+  const n = T.ringVertexNormal(square, 1);
+  assert.ok(Math.abs(Math.hypot(n[0], n[1]) - 1) < 1e-9, 'must be a unit vector');
+  const chord = [10 - 0, 10 - 0];
+  assert.ok(Math.abs(n[0] * chord[0] + n[1] * chord[1]) < 1e-9, 'must be perpendicular');
+});
+
+test('a degenerate ring yields no normal rather than a NaN direction', () => {
+  assert.strictEqual(T.ringVertexNormal([[0, 0], [1, 1]], 0), null, 'fewer than 3 vertices');
+  // Neighbours coincident: there is no local direction to be perpendicular to.
+  assert.strictEqual(T.ringVertexNormal([[5, 5], [1, 1], [5, 5]], 1), null);
+});
