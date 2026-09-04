@@ -1,7 +1,10 @@
 # BhuNaksha / Cadastral Digitizer — Upgrade Instructions, adjusted to the real project
 
-This is the upgrade brief in `BhuNaksha_Digitizer_Final_Upgrade_Instructions.txt`, rewritten
-against the code that actually exists in this repository (v16.3.0, 434 tests).
+This is the v17 upgrade brief, rewritten against the code that actually exists in this
+repository (v16.3.0, 434 tests). The original —
+`BhuNaksha_Digitizer_Final_Upgrade_Instructions.txt` — has been removed from the working
+tree now that it is fully implemented; it remains in history at `b34b065` for anyone
+comparing this document against what was asked for.
 
 The original brief was written without sight of the codebase, so it asks for a number of
 things that are **already built and tested**, and it describes others in terms that do not
