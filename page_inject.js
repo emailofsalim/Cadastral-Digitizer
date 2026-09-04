@@ -26,7 +26,7 @@
   'use strict';
 
   /* Developed by Md Salim Ansari. MIT licensed — see LICENSE. */
-  const VERSION = '17.4.0';
+  const VERSION = '17.5.0';
   const WIDGET_ID = 'bnd15-widget';
   const STYLE_ID = 'bnd15-style';
   const OVERLAY_ID = 'bnd15-overlay';
@@ -78,6 +78,24 @@
    * these on a window global, which meant every slider reset on every visit.
    * =================================================================== */
   const DEFAULT_SETTINGS = {
+    /* ---- added in 17.5: automatic digitization on zoom ---------------- */
+    // OFF, and the default matters more than the feature: with it off not a
+    // single line of the new code runs — no timer is armed, no pixel is read,
+    // no geometry is considered. Turning it off again disarms the timer at
+    // once, so "off" is genuinely off rather than merely quiet.
+    autoDigitize: false,
+    // Below this map zoom the feature does nothing at all. Refining a boundary
+    // from pixels that are metres across would move vertices by more than the
+    // evidence supports, and reading the raster is the expensive part.
+    autoDigitizeMinZoom: 18,
+    // How far along the boundary normal the scan looks, in raster pixels. This
+    // is also the largest correction that can ever be made in one pass: a
+    // vertex cannot be moved further than the scan can see.
+    autoDigitizeSearchPx: 12,
+    // A vertex already this close to the detected edge is left alone. This is
+    // the anti-oscillation rule — re-analysing the same view finds nothing to
+    // do, so there is no detect-modify-render-detect loop.
+    autoDigitizeSettlePx: 1.5,
     colorTolerance: 40,
     wallLuminanceThreshold: 100,
     simplifyPx: 2.0,
@@ -194,6 +212,10 @@
     gcpRecommendation: null,
     backups: {},             // shapeId -> original points
     pickedColor: null,
+    /* ---- added in 17.5 ---------------------------------------------- */
+    // The view signature the automatic refinement last looked at, so holding
+    // still or re-rendering the same view does not re-run the analysis.
+    autoDigitizeSeen: null,
     plotNo: null,
     plotArea: null,
     plotBbox: null,
@@ -654,6 +676,7 @@
     // 2. Timers and render subscriptions.
     if (reattachTimer) { safe(() => clearInterval(reattachTimer)); reattachTimer = null; }
     if (overlayTimer) { safe(() => clearInterval(overlayTimer)); overlayTimer = null; }
+    safe(() => stopAutoDigitize());
     if (offRender) { safe(() => offRender()); offRender = null; }
 
     // 3. Resources that pin memory until released.
@@ -1477,6 +1500,208 @@
     try { img = ctx.getImageData(minX, minY, w, h); }
     catch (e) { return { tainted: true }; }
     return { raster: { data: img.data, width: w, height: h }, minX, minY };
+  }
+
+  /* =====================================================================
+   * AUTOMATIC DIGITIZATION ON ZOOM  (17.5)
+   * ---------------------------------------------------------------------
+   * Zoom into a boundary and the parcel's vertices there settle onto the
+   * colour edge you picked. Zoom somewhere else and that section settles too.
+   * The rest of the parcel is not touched, and neither is anything else.
+   *
+   * WHAT THIS DELIBERATELY DOES NOT DO
+   *
+   * It never inserts or removes a vertex — it only moves existing ones a
+   * short way along their own boundary normal. That is the smallest geometry
+   * change that can express "the boundary is actually here", and it makes two
+   * whole classes of bug impossible rather than merely unlikely: the vertex
+   * count cannot grow however many times an area is inspected, and a parcel
+   * cannot be quietly rebuilt into something the operator did not draw.
+   *
+   * It never retraces the view, never touches an unselected parcel, and never
+   * runs at all unless the operator turned it on.
+   *
+   * WHY IT IS SAFE TO LET IT WRITE GEOMETRY
+   *
+   * Every candidate has to survive Tracer.refineEdgeAlongNormal's refusals —
+   * one clean crossing, both runs long enough, wholly inside readable pixels.
+   * Anything ambiguous returns nothing, and nothing is what happens. The bias
+   * is always towards leaving the geometry alone.
+   *
+   * And what it does write is ORDINARY geometry: the same points array, moved
+   * under the same commit() the manual tools use, through the same
+   * refreshShapeMetrics. There is no automatic-geometry type, no second
+   * history, no lock. Undo reverts it, Redo restores it, and every Edit tool
+   * works on it afterwards, because as far as the rest of the application is
+   * concerned nothing unusual happened.
+   * =================================================================== */
+
+  /* Is this a moment when automatic refinement may run at all? Every answer
+   * here is "no" by default; the feature has to earn each one. */
+  function autoDigitizeBlocker() {
+    if (!S.autoDigitize) return 'off';
+    const A = st.adapter;
+    if (!A) return 'no map';
+    if (st.busy) return 'busy';
+    // MANUAL WORK HAS PRIORITY. A drag in progress, a half-finished outline or
+    // a modal dialog all mean the operator is mid-thought; moving their
+    // geometry underneath them would be indefensible however good the evidence.
+    if (gesture && gesture.drag) return 'a manual edit is in progress';
+    if (st.mode === 'draw' && st.drawPoints.length) return 'an outline is being drawn';
+    if (st.crsAsk || st.csvDialog) return 'a dialog is open';
+    if (!st.pickedColor) return 'no colour has been picked';
+    const shape = selectedShape();
+    if (!shape) return 'no parcel is selected';
+    if (isHidden(shape.id)) return 'the selected parcel is hidden';
+    const z = safe(() => A.getZoom(), null);
+    if (z == null) return 'the map zoom is unreadable';
+    if (z < (Number(S.autoDigitizeMinZoom) || 18)) return 'zoomed too far out';
+    return null;
+  }
+
+  /* A short string that changes when the view does. Holding still, or the map
+   * repainting for its own reasons, must not re-run the analysis (§24). */
+  function autoDigitizeViewKey() {
+    const A = st.adapter;
+    const z = safe(() => A.getZoom(), null);
+    const c = safe(() => A.getCenter(), null);
+    const shape = selectedShape();
+    if (z == null || !c || !shape) return null;
+    const col = st.pickedColor;
+    return [shape.id, z.toFixed(3), c[0].toFixed(6), c[1].toFixed(6),
+      col.r, col.g, col.b, S.colorTolerance].join('|');
+  }
+
+  /* One pass over the visible part of the selected parcel. Returns the number
+   * of vertices moved, which is 0 far more often than not — and 0 means no
+   * commit was made, so an unproductive pass leaves no trace in the history. */
+  function runAutoDigitizePass() {
+    const blocked = autoDigitizeBlocker();
+    if (blocked) return 0;
+    const A = st.adapter;
+    const shape = selectedShape();
+
+    // The map's own canvas, read directly. No tab capture: that hides the
+    // panel for a frame, and a panel that blinks every time the view settles
+    // would be intolerable. Where the canvas cannot be read — a cross-origin
+    // portal — the answer is simply that no refinement happens here (§21).
+    // Browser security is never worked around.
+    const canvas = safe(() => A.getCanvas(), null);
+    if (!canvas || !canvas.width || !canvas.height) return 0;
+    const ctx = safe(() => canvas.getContext('2d', { willReadFrequently: true }), null);
+    if (!ctx) return 0;
+    let img = null;
+    try { img = ctx.getImageData(0, 0, canvas.width, canvas.height); }
+    catch (e) { return 0; }          // tainted: not readable, so nothing is done
+    if (!img) return 0;
+    const raster = { data: img.data, width: canvas.width, height: canvas.height };
+
+    // The parcel's ring in canvas pixels, via the adapter's own conversion —
+    // no new projection, no new coordinate system.
+    const ringPx = [];
+    for (const p of shape.points) {
+      const client = safe(() => A.mapCoordToClient(p[0], p[1]), null);
+      const px = client ? safe(() => A.clientToCanvasPixel(client[0], client[1]), null) : null;
+      if (!px || !isFinite(px[0]) || !isFinite(px[1])) return 0;
+      ringPx.push([px[0], px[1]]);
+    }
+    if (ringPx.length < 3) return 0;
+
+    const searchPx = Math.max(2, Number(S.autoDigitizeSearchPx) || 12);
+    const opts = {
+      target: st.pickedColor,
+      tolerance: Number(S.colorTolerance) || 40,
+      searchPx,
+      settlePx: Number(S.autoDigitizeSettlePx) || 1.5,
+      minRunPx: 3,
+    };
+
+    // Collect first, apply after: a pass that finds nothing must not have
+    // touched the shape, and one that finds several must be a single change.
+    const moves = [];
+    for (let i = 0; i < ringPx.length; i++) {
+      const [vx, vy] = ringPx[i];
+      // Only vertices comfortably inside the readable raster are candidates.
+      // A vertex near the edge of the view has half its evidence off screen.
+      if (vx < searchPx || vy < searchPx
+        || vx > raster.width - searchPx - 1 || vy > raster.height - searchPx - 1) continue;
+      const nrm = Tracer.ringVertexNormal(ringPx, i);
+      if (!nrm) continue;
+      const r = Tracer.refineEdgeAlongNormal(raster, vx, vy, nrm[0], nrm[1], opts);
+      if (!r.ok) continue;
+      // Back to map coordinates the same way the trace does it: canvas pixel to
+      // client, client to map. The existing conversion, in the existing CRS.
+      const client = safe(() => A.canvasPixelToClient(vx + r.dx, vy + r.dy), null);
+      const mapPt = client ? safe(() => A.clientToMapCoord(client[0], client[1]), null) : null;
+      if (!mapPt || !isFinite(mapPt[0]) || !isFinite(mapPt[1])) continue;
+      moves.push({ index: i, point: [mapPt[0], mapPt[1]], px: Math.abs(r.offset) });
+    }
+    if (!moves.length) return 0;
+
+    // ONE history entry for the whole local refinement (§13), taken before
+    // anything is written, through the ordinary commit() every manual tool
+    // uses — so Undo and Redo need to know nothing about this feature.
+    const crossBefore = crossingSnapshot();
+    commit(`refine ${moves.length} corner(s) of shape ${shape.id} from the picked colour`);
+    ensureBackup(shape);
+    const pts = shape.points.map((p) => p.slice());
+    for (const m of moves) pts[m.index] = m.point;
+    shape.points = pts;
+    refreshShapeMetrics(shape);
+    reportNewCrossings(crossBefore, 'Automatic refinement');
+    autosave(); draw(); renderWidget();
+    const far = moves.reduce((a, m) => Math.max(a, m.px), 0);
+    toastOk(`Automatic digitization: ${moves.length} corner(s) settled onto the picked colour, the furthest by ${far.toFixed(1)} px. Ctrl+Z undoes it.`);
+    return moves.length;
+  }
+
+  /* Why nothing is happening, in one line. An automatic feature that silently
+   * does nothing is indistinguishable from a broken one, so the panel says
+   * which precondition is currently unmet. */
+  function autoDigitizeStatusLine() {
+    const why = autoDigitizeBlocker();
+    if (!why) return 'Ready — the selected parcel\u2019s visible corners will settle onto the picked colour.';
+    if (why === 'off') return 'Off.';
+    const z = safe(() => st.adapter && st.adapter.getZoom(), null);
+    if (why === 'zoomed too far out' && z != null) {
+      return `Waiting: zoom ${z.toFixed(1)}, needs ${S.autoDigitizeMinZoom}+.`;
+    }
+    return `Waiting: ${why}.`;
+  }
+
+  /* The trigger. A poll rather than a map event, because every adapter already
+   * answers getZoom/getCenter and none of them would have to be modified to
+   * add a listener — and the timer only exists while the feature is on.
+   *
+   * It fires on the pass AFTER the view stops changing, which is the debounce
+   * §24 asks for: panning and pinching produce no analysis at all, only the
+   * settled view does. */
+  let autoDigitizeTimer = null;
+  let autoDigitizeLastKey = null;
+  function autoDigitizeTick() {
+    if (!S.autoDigitize) return stopAutoDigitize();
+    if (autoDigitizeBlocker()) return;
+    const key = autoDigitizeViewKey();
+    if (!key) return;
+    if (key !== autoDigitizeLastKey) {
+      // The view has just changed: remember it and wait for the next tick, so
+      // a view still being moved is never analysed.
+      autoDigitizeLastKey = key;
+      return;
+    }
+    if (key === st.autoDigitizeSeen) return;   // settled, and already looked at
+    st.autoDigitizeSeen = key;
+    safe(() => runAutoDigitizePass());
+  }
+  function startAutoDigitize() {
+    stopAutoDigitize();
+    if (!S.autoDigitize) return;
+    autoDigitizeLastKey = null;
+    st.autoDigitizeSeen = null;
+    autoDigitizeTimer = setInterval(autoDigitizeTick, 700);
+  }
+  function stopAutoDigitize() {
+    if (autoDigitizeTimer) { safe(() => clearInterval(autoDigitizeTimer)); autoDigitizeTimer = null; }
   }
 
   async function runTrace(clientX, clientY) {
@@ -4961,6 +5186,11 @@ table.coord td:first-child{width:52px}
             <div class="field"><span>Imagery wait (ms)</span><input type="number" id="sWait" min="200" max="10000" step="100" value="${S.imageryWaitMs}"></div>
             <div class="field"><span>Batch: min parcel size (px)</span><input type="number" id="sBatchMin" min="50" step="50" value="${S.batchMinPixels}"></div>
             <div class="field"><span>Batch: max parcels</span><input type="number" id="sBatchMax" min="1" max="1000" value="${S.batchMaxRegions}"></div>
+            <div class="field"><span title="With a parcel selected and a colour picked, zooming in settles that parcel's visible corners onto the picked colour's edge. It only moves existing corners, never adds them, and only when the scan reads one clean boundary — anything ambiguous is left alone. Every change is one Ctrl+Z.">Automatic digitization on zoom</span><input type="checkbox" id="sAutoDig" ${S.autoDigitize ? 'checked' : ''}></div>
+            ${S.autoDigitize ? `<div class="field"><span title="Below this map zoom the feature does nothing at all">Automatic: minimum zoom</span><input type="number" id="sAutoDigZoom" min="1" max="24" step="1" value="${S.autoDigitizeMinZoom}"></div>
+            <div class="field"><span title="How far along the boundary the scan looks — also the largest correction a corner can receive in one pass">Automatic: search (px)</span><input type="number" id="sAutoDigSearch" min="3" max="60" step="1" value="${S.autoDigitizeSearchPx}"></div>
+            <div class="field"><span title="A corner already this close to the detected edge is treated as correct and left alone. This is what stops the same view being refined over and over.">Automatic: settled within (px)</span><input type="number" id="sAutoDigSettle" min="0.1" max="20" step="0.1" value="${S.autoDigitizeSettlePx}"></div>
+            <div class="dim" style="font-size:10.5px">${esc(autoDigitizeStatusLine())}</div>` : ''}
           </details>
 
           <details style="margin-top:5px"><summary class="dim" style="cursor:pointer;font-weight:700">Clean-up</summary>
@@ -5259,6 +5489,21 @@ table.coord td:first-child{width:52px}
     on('sLive', 'onchange', (e) => { S.liveRefit = e.target.checked; saveSettings(); });
     on('sSnap', 'onchange', (e) => { S.snapEnabled = e.target.checked; saveSettings(); });
     on('sAutoReg', 'onchange', (e) => { S.autoRegulariseOnTrace = e.target.checked; saveSettings(); });
+    on('sAutoDig', 'onchange', (e) => {
+      S.autoDigitize = e.target.checked;
+      saveSettings();
+      // On arms the timer, off disarms it in the same breath — "off" means no
+      // timer exists, not a timer that keeps waking to decide to do nothing.
+      if (S.autoDigitize) startAutoDigitize(); else stopAutoDigitize();
+      renderWidget();
+      toast(S.autoDigitize
+        ? 'Automatic digitization is on. Select a parcel, pick a colour, and zoom in — corners settle onto that colour where the boundary is unambiguous.'
+        : 'Automatic digitization is off. Nothing is analysed and no geometry is changed automatically.',
+      S.autoDigitize ? 'ok' : 'info', 7000);
+    });
+    bind('sAutoDigZoom', 'autoDigitizeMinZoom', Number);
+    bind('sAutoDigSearch', 'autoDigitizeSearchPx', Number);
+    bind('sAutoDigSettle', 'autoDigitizeSettlePx', Number);
     on('sShared', 'onchange', (e) => { S.dragSharedCorners = e.target.checked; saveSettings(); });
     on('sWarnCross', 'onchange', (e) => { S.warnNewCrossings = e.target.checked; saveSettings(); });
     on('sAutoGcp', 'onchange', (e) => { S.autoGcpFromEdit = e.target.checked; saveSettings(); });
@@ -5766,6 +6011,9 @@ table.coord td:first-child{width:52px}
     // untracked interval would stack one more copy on every reset.
     if (reattachTimer) clearInterval(reattachTimer);
     reattachTimer = setInterval(() => { ensureOverlay(); installGestures(); }, 2000);
+    // Only when the operator has turned it on. Off is the default, and off
+    // arms nothing — there is no timer to wake and no code path to enter.
+    startAutoDigitize();
 
     buildWidget();
     reportCount();

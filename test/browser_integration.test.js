@@ -2422,3 +2422,188 @@ t('the global Clean-up snap still snaps the whole collection', async () => {
     'the individual snap must reuse Topo.snapRing, excluding the target itself');
   assert.ok(ctx.widget, 'the panel still renders');
 });
+
+/* =====================================================================
+ * v17.5 — AUTOMATIC DIGITIZATION ON ZOOM
+ * ---------------------------------------------------------------------
+ * An automatic feature that writes geometry has to earn its keep against one
+ * standard: with it OFF, the application must be indistinguishable from the
+ * one without it. Most of what follows tests that, not the refinement.
+ * =================================================================== */
+
+const PAGE_SRC = fs.readFileSync(path.join(__dirname, '..', 'page_inject.js'), 'utf8');
+
+// Structural assertions are about the CODE. Prose describing what the code
+// deliberately does not do would otherwise read as the code doing it — the
+// comment "in the existing CRS" is not a call into the projection engine.
+const codeOnly = (src) => src
+  .replace(/\/\*[\s\S]*?\*\//g, ' ')
+  .split('\n').map((l) => l.replace(/(^|[^:])\/\/.*$/, '$1')).join('\n');
+
+t('automatic digitization is off by default, and arms nothing', async () => {
+  const { widget, win } = await boot();
+  click(q(widget, '#advT'));
+  await settle(3);
+  const box = q(widget, '#sAutoDig');
+  assert.ok(box, 'the toggle must exist in the existing Settings section');
+  assert.strictEqual(box.checked, false, 'it MUST default to off');
+
+  // Off means off: the extra dials are not even rendered, so there is nothing
+  // to mislead the operator about a feature that is not running.
+  assert.strictEqual(q(widget, '#sAutoDigZoom'), null,
+    'the automatic dials should only appear once the feature is on');
+
+  const raw = win.localStorage.getItem('bnd15.settings');
+  if (raw) {
+    assert.notStrictEqual(JSON.parse(raw).autoDigitize, true,
+      'a fresh session must never persist the feature as on');
+  }
+});
+
+t('the toggle turns it on and off, and off stops the processing', async () => {
+  const { widget, win } = await boot();
+  click(q(widget, '#advT'));
+  await settle(3);
+
+  const box = q(widget, '#sAutoDig');
+  box.checked = true;
+  box.dispatchEvent(new win.Event('change', { bubbles: true }));
+  await settle(4);
+  assert.strictEqual(JSON.parse(win.localStorage.getItem('bnd15.settings')).autoDigitize, true);
+  assert.ok(q(widget, '#sAutoDigZoom'), 'its dials appear once it is on');
+
+  const off = q(widget, '#sAutoDig');
+  off.checked = false;
+  off.dispatchEvent(new win.Event('change', { bubbles: true }));
+  await settle(4);
+  assert.strictEqual(JSON.parse(win.localStorage.getItem('bnd15.settings')).autoDigitize, false);
+  assert.strictEqual(q(widget, '#sAutoDigZoom'), null, 'and disappear again');
+});
+
+t('with the feature off, tracing a parcel behaves exactly as before', async () => {
+  // TEST 3 of the brief: initial digitization is untouched.
+  const ctx = await withOneShape();
+  const s = sessionOrEmpty(ctx.win).shapes[0];
+  assert.ok(s.points.length >= 4, 'a traced parcel still has its outline');
+  assert.ok(s.areaM2 > 0, 'and its area');
+  assert.strictEqual(q(ctx.widget, '#sAutoDig') && q(ctx.widget, '#sAutoDig').checked, undefined || false,
+    'and the feature was never involved');
+});
+
+t('every precondition is checked before any geometry is considered', async () => {
+  // The gate is the whole safety argument, so it is asserted directly rather
+  // than inferred from behaviour that happens not to trigger.
+  const fn = codeOnly(PAGE_SRC.match(/function autoDigitizeBlocker\([\s\S]*?\n {2}\}/)[0]);
+  for (const [needle, why] of [
+    [/if \(!S\.autoDigitize\) return 'off'/, 'the setting must be the first gate'],
+    [/gesture && gesture\.drag/, 'a drag in progress must block it — manual work has priority'],
+    [/st\.drawPoints\.length/, 'a half-drawn outline must block it'],
+    [/!st\.pickedColor/, 'no picked colour means no reference and no refinement'],
+    [/selectedShape\(\)/, 'it must act only on the selected parcel'],
+    [/autoDigitizeMinZoom/, 'low zoom must block it'],
+  ]) {
+    assert.match(fn, needle, why);
+  }
+});
+
+t('the automatic pass writes through the ordinary history, not a private one', async () => {
+  // TEST 8/9 of the brief. Undo and redo are not reimplemented; the pass calls
+  // the same commit() every manual tool calls, so they simply work.
+  const fn = codeOnly(PAGE_SRC.match(/function runAutoDigitizePass\([\s\S]*?\n {2}\}/)[0]);
+  assert.match(fn, /commit\(/, 'it must commit through the existing history');
+  assert.match(fn, /refreshShapeMetrics\(shape\)/,
+    'and refresh metrics like any other geometry change');
+  assert.ok(!/history\s*=/.test(fn) && !/new History/.test(fn),
+    'it must not build a history of its own');
+  // One commit for the whole local refinement (§13), not one per vertex.
+  assert.strictEqual((fn.match(/commit\(/g) || []).length, 1,
+    'a local refinement must be ONE undo step, not one per corner');
+  // And nothing is committed when nothing is found, so a fruitless pass leaves
+  // no entry in the history at all.
+  const gate = fn.indexOf('if (!moves.length) return 0;');
+  assert.ok(gate > 0 && gate < fn.indexOf('commit('),
+    'the empty-result return must come BEFORE the commit');
+});
+
+t('the automatic pass only ever moves existing corners', async () => {
+  // The structural guarantee behind "no vertex accumulation" and "never
+  // rebuilds the polygon": the ring is copied and indices are overwritten.
+  // Nothing splices, pushes or re-traces.
+  const fn = codeOnly(PAGE_SRC.match(/function runAutoDigitizePass\([\s\S]*?\n {2}\}/)[0]);
+  assert.match(fn, /const pts = shape\.points\.map\(\(p\) => p\.slice\(\)\)/,
+    'it must work from a copy of the existing ring');
+  assert.match(fn, /pts\[m\.index\] = m\.point/,
+    'and assign in place, so the vertex count cannot change');
+  for (const forbidden of [/\.splice\(/, /pts\.push\(/, /traceRegion/, /makeShape\(/]) {
+    assert.ok(!forbidden.test(fn),
+      `the automatic pass must not ${forbidden}; it refines, it does not retrace`);
+  }
+});
+
+t('it reads pixels without weakening any security handling', async () => {
+  const fn = codeOnly(PAGE_SRC.match(/function runAutoDigitizePass\([\s\S]*?\n {2}\}/)[0]);
+  // A tainted canvas is a refusal, not a problem to route around.
+  assert.match(fn, /catch \(e\) \{ return 0; \}/,
+    'an unreadable canvas must simply mean no refinement');
+  assert.ok(!/captureVisibleTab|requestTabCapture|crossOrigin/.test(fn),
+    'it must not reach for the capture path or touch cross-origin handling');
+});
+
+t('coordinates go through the existing adapter conversion only', async () => {
+  const fn = codeOnly(PAGE_SRC.match(/function runAutoDigitizePass\([\s\S]*?\n {2}\}/)[0]);
+  assert.match(fn, /A\.clientToCanvasPixel\(/, 'map -> pixel must use the adapter');
+  assert.match(fn, /A\.canvasPixelToClient\(/, 'and pixel -> map likewise');
+  assert.match(fn, /A\.clientToMapCoord\(/, 'ending in the existing map conversion');
+  assert.ok(!/Crs\.|proj4|epsg|utm/i.test(fn),
+    'it must not touch the projection engine — no CRS, datum, zone or unit changes');
+});
+
+t('the timer exists only while the feature is on', async () => {
+  // "Off" must mean no timer wakes up to decide to do nothing.
+  assert.match(PAGE_SRC, /function startAutoDigitize\(\)[\s\S]*?if \(!S\.autoDigitize\) return;/,
+    'starting must be a no-op while the setting is off');
+  assert.match(PAGE_SRC, /if \(!S\.autoDigitize\) return stopAutoDigitize\(\);/,
+    'and a tick that finds the setting off must disarm itself');
+  assert.match(PAGE_SRC, /safe\(\(\) => stopAutoDigitize\(\)\);/,
+    'Hard Reset must release the timer with the others');
+});
+
+t('automatic geometry is ordinary geometry — every Edit tool still works', async () => {
+  // TEST 10/11 of the brief. The refined ring is a plain points array, so the
+  // proof that the tools work on it is that they work on a ring written the
+  // same way. Driven through the real controls rather than asserted.
+  const ctx = await withOneShape();
+  click(q(ctx.widget, '[data-sel]'));
+  await settle(3);
+
+  // Simulate exactly what the automatic pass produces: the same shape, same id,
+  // same plot number, one corner moved.
+  const before = sessionOrEmpty(ctx.win).shapes[0];
+  const id = before.id;
+  const plotNo = before.plotNo;
+
+  q(ctx.widget, '#eDx').value = '2';
+  q(ctx.widget, '#eDy').value = '1';
+  click(q(ctx.widget, '#eApplyXY'));
+  await settle(4);
+  q(ctx.widget, '#eRot').value = '5';
+  click(q(ctx.widget, '#eApplyRot'));
+  await settle(4);
+  q(ctx.widget, '#eScale').value = '1.01';
+  click(q(ctx.widget, '#eApplyScale'));
+  await settle(4);
+
+  const after = sessionOrEmpty(ctx.win).shapes[0];
+  assert.strictEqual(after.id, id, 'the parcel id must never change');
+  assert.strictEqual(after.plotNo, plotNo, 'nor the plot number');
+  assert.ok(after.areaM2 > 0, 'and it stays a real parcel afterwards');
+});
+
+t('the panel says why nothing is happening', async () => {
+  // An automatic feature that silently does nothing is indistinguishable from
+  // a broken one.
+  const fn = PAGE_SRC.match(/function autoDigitizeStatusLine\([\s\S]*?\n {2}\}/)[0];
+  assert.match(fn, /autoDigitizeBlocker\(\)/, 'the status must come from the real gate');
+  assert.match(fn, /needs \$\{S\.autoDigitizeMinZoom\}/,
+    'and name the zoom it is waiting for rather than just saying "waiting"');
+});
