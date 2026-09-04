@@ -1768,3 +1768,188 @@ t('Shapefile is one ADDITIONAL import option, with the others left alone', async
     'Shapefile is appended, so nothing above it moved');
   assert.match(q(widget, '#iShp').textContent, /Shapefile/);
 });
+
+/* =====================================================================
+ * v17.3.2 — PARCEL VISIBILITY, AUTO-FOCUS
+ * ---------------------------------------------------------------------
+ * The thing that matters about hiding is that it is DISPLAY ONLY. A control
+ * that quietly dropped a parcel from the project, or from an export, would
+ * look identical in the panel and cost the operator work they had already
+ * done — so those are what is asserted, not merely that the row toggles.
+ * =================================================================== */
+
+t('every parcel row carries a visibility control', async () => {
+  const ctx = await withOneShape();
+  const rows = ctx.widget.querySelectorAll('.list .item');
+  assert.ok(rows.length >= 1, 'there should be a parcel to look at');
+  for (const row of rows) {
+    assert.ok(row.querySelector('[data-vis]'), 'each row needs its own eye');
+    assert.ok(row.querySelector('[data-sel]'), 'and the existing controls are untouched');
+    assert.ok(row.querySelector('[data-edit]'));
+  }
+});
+
+t('hiding a parcel changes only what is drawn — never the data', async () => {
+  const ctx = await withOneShape();
+  const before = JSON.parse(JSON.stringify(sessionOrEmpty(ctx.win).shapes));
+  assert.strictEqual(before.length, 1);
+
+  click(q(ctx.widget, '[data-vis]'));
+  await settle(2);
+
+  const after = sessionOrEmpty(ctx.win).shapes;
+  assert.strictEqual(after.length, 1, 'the parcel must NOT be deleted');
+  assert.deepStrictEqual(after[0].points, before[0].points, 'vertices unchanged');
+  assert.strictEqual(after[0].id, before[0].id, 'id unchanged');
+  assert.strictEqual(after[0].areaM2, before[0].areaM2, 'area unchanged');
+  // The list keeps it, in place, so it can be brought back.
+  assert.strictEqual(ctx.win.document.querySelectorAll('.list .item').length, 1);
+});
+
+t('a hidden parcel comes back exactly as it was', async () => {
+  const ctx = await withOneShape();
+  const before = JSON.parse(JSON.stringify(sessionOrEmpty(ctx.win).shapes));
+  const eye = () => ctx.win.document.querySelector('[data-vis]');
+  click(eye()); await settle(2);
+  click(eye()); await settle(2);
+  assert.deepStrictEqual(sessionOrEmpty(ctx.win).shapes[0].points, before[0].points);
+});
+
+t('Hide All and Show All hide and restore without deleting anything', async () => {
+  const ctx = await withOneShape();
+  const before = sessionOrEmpty(ctx.win).shapes.length;
+
+  click(q(ctx.win.document, '#visAll'));           // hide all
+  await settle(2);
+  assert.strictEqual(sessionOrEmpty(ctx.win).shapes.length, before, 'nothing is deleted by Hide All');
+  assert.match(ctx.win.document.querySelector('#visAll').textContent, /Show all/,
+    'the control flips to Show all so the way back is obvious');
+
+  click(q(ctx.win.document, '#visAll'));           // show all
+  await settle(2);
+  assert.strictEqual(sessionOrEmpty(ctx.win).shapes.length, before);
+  assert.match(ctx.win.document.querySelector('#visAll').textContent, /Hide all/);
+  // And the per-parcel control still works afterwards.
+  click(ctx.win.document.querySelector('[data-vis]'));
+  await settle(2);
+  assert.strictEqual(sessionOrEmpty(ctx.win).shapes.length, before);
+});
+
+t('hiding a parcel does not remove it from an export', async () => {
+  // Hidden is a view state. An export that quietly dropped hidden parcels
+  // would lose work the operator believes is saved, and nothing would say so.
+  const ctx = await withOneShape();
+  click(q(ctx.widget, '[data-vis]'));
+  await settle(2);
+  click(q(ctx.win.document, '#btnExport'));
+  await settle(1);
+  const before = ctx.downloads.length;
+  click(q(ctx.win.document, '#xGeo'));
+  await settle(4);
+  assert.ok(ctx.downloads.length > before,
+    'a hidden parcel is still a parcel: the export must be produced, not refused as empty');
+  assert.match(ctx.downloads[ctx.downloads.length - 1].name, /\.geojson$/);
+  // And it is still in the session that the export reads from.
+  assert.strictEqual(sessionOrEmpty(ctx.win).shapes.length, 1);
+});
+
+t('selecting a parcel scrolls its row into view without moving the page', async () => {
+  const ctx = await withOneShape();
+  const list = q(ctx.win.document, '.list');
+  assert.ok(list, 'the shapes list is the only thing that may scroll');
+  // jsdom reports zero layout, so the guard that matters here is the negative
+  // one: the implementation must not reach for scrollIntoView, which would
+  // scroll the host portal's own page out from under the operator.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'page_inject.js'), 'utf8');
+  const fn = src.match(/function focusSelectedRow\([\s\S]*?\n  \}/)[0];
+  assert.ok(!/scrollIntoView/.test(fn),
+    'scrollIntoView walks up to the page; only the list container may be scrolled');
+  assert.ok(/scrollTop/.test(fn), 'the list scroll position is what moves');
+  assert.ok(!/\.focus\(/.test(fn), 'auto-focus must not steal keyboard focus from an input');
+  assert.ok(/data-row=/.test(src), 'rows are found by the shape id, not by matching their text');
+});
+
+t('auto-focus never reorders the shape collection', async () => {
+  const ctx = await withOneShape();
+  const order = sessionOrEmpty(ctx.win).shapes.map((s) => s.id);
+  click(q(ctx.widget, '[data-sel]'));
+  await settle(2);
+  assert.deepStrictEqual(sessionOrEmpty(ctx.win).shapes.map((s) => s.id), order,
+    'selection scrolls the list; it must never sort or move a row');
+});
+
+/* =====================================================================
+ * v17.3.2 — DXF ON A LIVE PORTAL: the view is no longer stranded
+ * ---------------------------------------------------------------------
+ * Reported from the field: after a DXF import the portal's map went blank.
+ *
+ * The importer was not at fault. A DXF routinely carries LOCAL CAD
+ * coordinates — a site datum, a few hundred units from an arbitrary origin —
+ * and the import moved the view to them unconditionally. Read as eastings and
+ * northings, (250, 250) in UTM 45N is a point on the equator off West Africa,
+ * so the portal panned there, found no tiles, and showed nothing.
+ *
+ * Only the camera move is now conditional. The parcels import either way.
+ * =================================================================== */
+
+t('a DXF in local drawing coordinates imports without stranding the map', async () => {
+  const { win, widget } = await boot();
+  const centreBefore = win.map.getView().getCenter().slice();
+
+  // Small numbers around an arbitrary origin: an ordinary site drawing.
+  const dxf = [
+    '0', 'SECTION', '2', 'ENTITIES',
+    '0', 'LWPOLYLINE', '8', 'P', '70', '1',
+    '10', '100', '20', '100',
+    '10', '340', '20', '100',
+    '10', '340', '20', '340',
+    '0', 'ENDSEC', '0', 'EOF',
+  ].join('\r\n');
+
+  feedNextFilePicker(win, 'site.dxf', dxf);
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iDxf'));
+  await settle(12);
+
+  // The import still happens — that is the part that was never broken.
+  assert.strictEqual(sessionOrEmpty(win).shapes.length, 1,
+    'the DXF must import exactly as before');
+
+  // But the portal is left where the operator had it, so the basemap is still
+  // under them and they can see what happened.
+  assert.deepStrictEqual(win.map.getView().getCenter(), centreBefore,
+    'the view must not be panned to a location the coordinates do not really name');
+
+  // And they are told, rather than left wondering why the parcels are not
+  // where they expected — the message names the location it worked out.
+  const toasts = win.document.getElementById('bnd15-toasts');
+  assert.match(String(toasts && toasts.textContent),
+    /long way from the map you are on|local drawing coordinates/,
+    'the operator must be told why the view did not move');
+});
+
+t('a DXF in real survey coordinates still moves the view as it always did', async () => {
+  // The guard must not cost a legitimate import its automatic overlay-and-look.
+  const { win, widget } = await boot();
+  const centreBefore = win.map.getView().getCenter().slice();
+
+  const dxf = [
+    '0', 'SECTION', '2', 'ENTITIES',
+    '0', 'LWPOLYLINE', '8', 'P', '70', '1',
+    '10', '432500.25', '20', '2618400.75',
+    '10', '432540.25', '20', '2618400.75',
+    '10', '432540.25', '20', '2618440.75',
+    '0', 'ENDSEC', '0', 'EOF',
+  ].join('\r\n');
+
+  feedNextFilePicker(win, 'plots.dxf', dxf);
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iDxf'));
+  await settle(12);
+
+  assert.strictEqual(sessionOrEmpty(win).shapes.length, 1);
+  assert.notDeepStrictEqual(win.map.getView().getCenter(), centreBefore,
+    'a real import must still bring the view to the parcels');
+});
