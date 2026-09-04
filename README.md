@@ -1,4 +1,4 @@
-# Cadastral Digitizer — v17.3
+# Cadastral Digitizer — v17.3.1
 
 **Developed by Md Salim Ansari** · MIT licence (see [LICENSE](LICENSE))
 
@@ -9,10 +9,10 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
 **Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store. Submission answers — single purpose, permission justifications, data-usage declarations and a privacy policy — are drafted in [docs/chrome-web-store.md](docs/chrome-web-store.md).
-**Tests:** `npm test` — 594 tests. No install needed: 509 run immediately, and 85 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 613 tests. No install needed: 524 run immediately, and 89 that need a browser skip cleanly. To enable those:
 
 ```bash
-npm install --no-save jsdom            # 65 DOM integration tests
+npm install --no-save jsdom            # 69 DOM integration tests
 npm install --no-save playwright-core  # 20 real-Chrome E2E tests (needs a Chrome binary)
 ```
 
@@ -55,6 +55,7 @@ Both menus stay in the DOM when closed and are revealed with a class. That is no
 | **KMZ / KML** | Polygons, linear rings, names, descriptions, `ExtendedData` and `SimpleData` attributes. |
 | **CSV vertices** | `ID,X,Y`, `ID,E,N`, `ID,X,Y,Z`, `ID,Lat,Lon` — with delimiter sniffing, a preview, and per-column mapping you confirm before anything is read. |
 | **GeoJSON** | Because this tool writes it, and a format it writes but cannot read back is a gap the operator finds. |
+| **Shapefile** | A zipped `.shp`/`.shx`/`.dbf`/`.prj`, or those files picked together. Polygons, multi-part polygons and lines; DBF attributes travel with the parcel and a plot-number field is recognised among them. |
 
 Imported rings become **ordinary shapes**. Not a separate layer type with its own editor — the same objects a traced parcel produces, so Edit, Move, Clean-up, control points, undo/redo, area calculation and all eight exports work on them with no code path of their own. Supporting import was a reader, not a special case threaded through the application; the same argument the raster workspace made in v16.
 
@@ -65,6 +66,31 @@ Imported rings become **ordinary shapes**. Not a separate layer type with its ow
 **Unsupported content is skipped with a reason.** A cadastral KMZ routinely carries ground overlays, network links and 3D models; a DXF carries circles and splines with no vertex list. Refusing the whole file over one unreadable placemark is the wrong trade when the other forty parcels are good, so each is counted and named.
 
 KMZ inflation uses the platform's `DecompressionStream('deflate-raw')`, present in Chrome and in Node ≥18, rather than bundling an inflate implementation that could not be tested here.
+
+### Shapefile import
+
+A shapefile is a multi-file dataset, so both practical ways in are accepted: **a ZIP**, which is how one is normally sent, or the **`.shp`, `.shx`, `.dbf` and `.prj` picked together**. The ZIP is unpacked in memory with the project's own reader — the one KMZ import already uses — and nothing is ever written to your computer.
+
+What it does with what it finds:
+
+- **Polygons and multi-part polygons.** Parts stay separate parcels rather than being merged into one ring across the gap between them. Lines import too; points cannot become a parcel and are counted and named instead of silently dropped.
+- **Holes are reported, not imported.** This tool's geometry model is one ring per parcel with no holes. Importing an inner ring as its own parcel would put a solid plot inside the plot it was cut out of, and nothing downstream would flag it — so it is listed as skipped, with the reason.
+- **DBF attributes travel with the parcel**, and a plot-number field is recognised among the names cadastral shapefiles actually use (`PLOT_NO`, `KHASRA`, `SURVEY_NO` and so on). Everything else is kept as attributes regardless, so a wrong guess costs nothing.
+- **The CRS is read from `.prj`, or asked for.** An EPSG code is recovered and handed to the *existing* CRS engine — there is no second projection code. Where the `.prj` is missing or names something unrecognised, the coordinates are left exactly as they are and the panel asks which system they are in. **It never assumes WGS 84**, which on a cadastral parcel would be a silent error of hundreds of kilometres.
+
+Imported parcels are ordinary shapes, so editing, snapping, area, quality checks and every export work on them with no code of their own.
+
+### Hard Reset
+
+One button, below the editing controls, and a second in the toolbar popup for when the panel itself is the thing that has stopped responding.
+
+It restarts the **extension**, not the page. Whatever is running is cancelled, timers and listeners are released, temporary rasters and object URLs are let go, the panel is torn down, and startup runs again through the *same* `boot()` the extension normally uses — so there is only ever one startup path and one panel afterwards.
+
+- **It does not ask.** A confirmation dialog is one more thing that might not respond when the reason you are pressing it is that something is stuck.
+- **It does not reload the page.** Your portal keeps its map, its layers, its login and the parcel you had selected. Reloading would be the easy implementation and the wrong one.
+- **Your files are untouched** — saved projects, exports, source images, PDFs and shapefiles are never written to.
+- **Pressing it repeatedly is safe.** Everything `boot()` attaches is released first, so a second press cannot leave a second panel, a second keyboard handler or a second timer behind. That is asserted by test, because it is the kind of fault that would accumulate silently.
+- **Your work comes back.** Restarting goes through the normal startup, which restores the autosaved session — so a hung extension costs you the hang, not your parcels.
 
 ### Coordinate systems: convert what is known, ask about what is not
 
@@ -436,9 +462,10 @@ lib/site_adapters.js   map-library adapters + portal registry
 lib/history.js         snapshot undo/redo over the whole session
 lib/importers.js       DXF, KML/KMZ, GeoJSON and CSV readers
 lib/geom_edit.js       move/rotate/scale, the shift record, RF + scale-bar calibration
+lib/shapefile.js       ESRI Shapefile reader — .shp / .dbf / .prj, and the ZIP
 vendor/                PDF.js, vendored verbatim (Apache-2.0) — the only third-party
                        code shipped; injected on demand, never fetched
-test/                  594 tests — npm test
+test/                  613 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```
@@ -477,13 +504,13 @@ Everything in `lib/` is pure — no DOM, no map object — so the code the exten
 
 **A note on settings.** Two settings were found carrying their weight in name only. `showValidityWarnings` had no control and nothing read it — it promised control over behaviour that did not exist, so it is gone; flagging a self-intersecting ring is a correctness signal and not the sort of thing a checkbox should be able to silence. `bboxLeakWarnPct` was likewise dead, but the check it named turned out to be worth building, so it now does what it always claimed. A test asserts that every setting is both read by the code and reachable from the panel, or else appears on a short list of deliberate internals — so a setting cannot quietly become decoration again.
 
-**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 594 every time.
+**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 613 every time.
 
 ---
 
 ## What is verified, and what is not
 
-**Verified by test (594, run with `npm test`):**
+**Verified by test (613, run with `npm test`):**
 
 - **The extension installed in real Chrome.** `test/chrome_e2e.test.js` loads the actual unpacked extension into headless Chrome via Playwright and exercises the parts no simulation can reach:
   - `chrome.scripting.executeScript` with `world: 'MAIN'` really injecting the libraries into the page's own JS world, in the right order — checked by having the *page* look for them.

@@ -39,6 +39,7 @@ const MAIN_WORLD_FILES = [
   'lib/history.js',
   'lib/importers.js',
   'lib/geom_edit.js',
+  'lib/shapefile.js',
   'page_inject.js',
 ];
 

@@ -1686,3 +1686,85 @@ t('an import that fails does not leave the file pinned', async () => {
   assert.match(ctx.win.document.body.textContent, /could not decode|damaged|unsupported/i,
     'the operator must be told the image could not be read');
 });
+
+/* =====================================================================
+ * v17.3.1 — HARD RESET
+ * ---------------------------------------------------------------------
+ * A recovery button, for when the panel itself has stopped responding. The
+ * things worth pinning are the ones that would make it useless: that it does
+ * not ask a question first, that it does not reload the host page, and above
+ * all that pressing it twice does not leave two of everything behind.
+ * =================================================================== */
+
+t('Hard Reset is present, and the four editing controls are untouched by it', async () => {
+  const { widget } = await boot();
+  assert.ok(q(widget, '#hardReset'), 'the recovery button must exist');
+  // The existing bar is what it always was — this is the regression the first
+  // attempt at placing the button actually caused, so it is asserted here too.
+  const bar = q(widget, '.bnd15-hist');
+  const ids = Array.from(bar.querySelectorAll('button')).map((b) => b.id);
+  assert.deepStrictEqual(ids, ['gUndo', 'gRedo', 'delLast', 'delAll'],
+    'Hard Reset must not have joined the editing controls');
+  assert.ok(q(widget, '#delAll'), 'Reset Everything stays exactly where it was');
+});
+
+t('Hard Reset does not ask, and does not reload the page', async () => {
+  const ctx = await withOneShape();
+  let asked = 0, reloaded = 0;
+  ctx.win.confirm = () => { asked++; return true; };
+  // jsdom will not let location.reload be replaced on some versions; counting
+  // a call either way is enough to catch an implementation that used it.
+  try { ctx.win.location.reload = () => { reloaded++; }; } catch (e) { /* frozen */ }
+
+  click(q(ctx.widget, '#hardReset'));
+  await settle(2);
+
+  assert.strictEqual(asked, 0,
+    'a recovery button must not be blocked by a dialog — the panel may be the thing that is stuck');
+  assert.strictEqual(reloaded, 0, 'the host portal must keep its map, layers and login');
+  assert.ok(ctx.win.document.getElementById('bnd15-widget'), 'the extension must come back up');
+});
+
+t('pressing Hard Reset repeatedly leaves exactly one of everything', async () => {
+  // The failure this guards against is subtle and permanent: boot() attaches a
+  // keydown listener and an interval, so a reset that did not release them
+  // would stack a second copy on every press and the panel would slowly start
+  // doing everything twice.
+  const ctx = await withOneShape();
+  for (let i = 0; i < 3; i++) {
+    click(q(ctx.win.document, '#hardReset'));
+    await settle(2);
+  }
+  const doc = ctx.win.document;
+  assert.strictEqual(doc.querySelectorAll('[id="bnd15-widget"]').length, 1, 'one panel');
+  assert.strictEqual(doc.querySelectorAll('[id="bnd15-overlay"]').length, 1, 'one overlay');
+  assert.strictEqual(doc.querySelectorAll('[id="bnd15-raster-workspace"]').length, 0,
+    'no orphaned workspace container');
+  // And it is genuinely usable afterwards, not merely present.
+  assert.ok(q(doc, '#mTrace'), 'the tools are back');
+
+  // Worth stating, because it is better than the brief requires. Restarting
+  // goes through the EXISTING boot(), which restores the autosaved session —
+  // so a hung extension costs the operator the hang, not their parcels. The
+  // brief allows unsaved runtime state to be lost; nothing says it must be.
+  assert.match(doc.getElementById('bnd15-widget').textContent, /1 shape\(s\) digitised/,
+    'work that had been autosaved should come back with the extension');
+});
+
+/* =====================================================================
+ * v17.3.1 — SHAPEFILE IMPORT
+ * =================================================================== */
+
+t('Shapefile is one ADDITIONAL import option, with the others left alone', async () => {
+  const { widget } = await boot();
+  const menu = q(widget, '#menuImport');
+  assert.ok(menu, 'the import menu must exist');
+  const ids = Array.from(menu.querySelectorAll('button')).map((b) => b.id);
+  // Every option that was there before is still there, in the same order.
+  for (const id of ['xLoad', 'iKml', 'iDxf', 'iCsv', 'iGeo', 'gcpImport', 'iImage', 'iPdf']) {
+    assert.ok(ids.includes(id), `${id} must still be in the Import menu`);
+  }
+  assert.strictEqual(ids.indexOf('iShp'), ids.length - 1,
+    'Shapefile is appended, so nothing above it moved');
+  assert.match(q(widget, '#iShp').textContent, /Shapefile/);
+});

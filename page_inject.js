@@ -26,7 +26,7 @@
   'use strict';
 
   /* Developed by Md Salim Ansari. MIT licensed — see LICENSE. */
-  const VERSION = '17.3.0';
+  const VERSION = '17.3.1';
   const WIDGET_ID = 'bnd15-widget';
   const STYLE_ID = 'bnd15-style';
   const OVERLAY_ID = 'bnd15-overlay';
@@ -54,6 +54,7 @@
   const HistoryLib = window.BND_History;
   const Imp = window.BND_Importers;
   const GeomEdit = window.BND_GeomEdit;
+  const Shp = window.BND_Shapefile;
 
   const missing = [
     ['lib/crs.js', Crs], ['lib/gcp_math.js', GcpMath], ['lib/tracer.js', Tracer],
@@ -241,6 +242,15 @@
     openMenu: null,              // 'import' | 'export' | null
     importSummary: null,         // what the last import brought in
   };
+
+  /* A pristine copy of the runtime state, taken before anything has run.
+   *
+   * Hard Reset restores from this rather than from a second copy of the
+   * literal above, which would be one more thing to keep in sync — and a state
+   * reset that quietly missed a field added later is exactly the bug a
+   * recovery button must not have. The literal is plain data, so a structural
+   * clone is faithful. */
+  const ST_PRISTINE = JSON.parse(JSON.stringify(st));
 
   /* =====================================================================
    * TOASTS — v13/v14 used blocking alert() for every error, including ones
@@ -586,6 +596,65 @@
     if (o.keepHistory !== true) history.clear();
   }
 
+  /* =====================================================================
+   * HARD RESET — restart the extension runtime, in place
+   * ---------------------------------------------------------------------
+   * A different thing from "Reset Everything", which stays exactly as it is.
+   * That one wipes the SESSION and asks first; this one restarts the
+   * EXTENSION and does not, because it exists for the case where the panel is
+   * wedged and a confirm dialog is one more thing that might not answer.
+   *
+   * It deliberately does NOT reload the page. The host portal keeps its map,
+   * its layers, its login and its selected parcel; only what this extension
+   * created is torn down. Reloading would be the easy implementation and the
+   * wrong one — the operator would lose the portal state they navigated to.
+   *
+   * Startup is the EXISTING boot(), not a second startup path. Everything
+   * boot() attaches is therefore released here first, or a second reset would
+   * stack a second copy of it.
+   * =================================================================== */
+  function hardReset() {
+    // 1. Stop extension-owned work that is still running. Each is wrapped
+    //    because the whole point of this button is that something is broken.
+    safe(() => { if (st.pdf && st.pdf.renderTask) st.pdf.renderTask.cancel(); });
+    safe(() => closePdfDocument());
+    safe(() => { if (importAbort) importAbort.abort(); });
+    importAbort = null;
+
+    // 2. Timers and render subscriptions.
+    if (reattachTimer) { safe(() => clearInterval(reattachTimer)); reattachTimer = null; }
+    if (overlayTimer) { safe(() => clearInterval(overlayTimer)); overlayTimer = null; }
+    if (offRender) { safe(() => offRender()); offRender = null; }
+
+    // 3. Resources that pin memory until released.
+    safe(() => releaseWorkspaceUrl());
+    safe(() => { if (st.workspace) st.workspace.destroy(); });
+
+    // 4. Extension-owned DOM and listeners. teardownSurface() already removes
+    //    the overlay and the gesture handlers; the rest is the panel furniture.
+    safe(() => teardownSurface());
+    safe(() => document.removeEventListener('keydown', onKeyDown, true));
+    for (const id of [WIDGET_ID, OVERLAY_ID, PILL_ID, TOAST_ID]) {
+      safe(() => { const el = document.getElementById(id); if (el && el.parentNode) el.parentNode.removeChild(el); });
+    }
+    // A workspace container orphaned by an earlier failure would otherwise
+    // survive as a second element with the same id.
+    safe(() => {
+      const stale = document.querySelectorAll('[id="' + Raster.CONTAINER_ID + '"]');
+      for (const el of stale) if (el.parentNode) el.parentNode.removeChild(el);
+    });
+
+    // 5. Runtime state back to how it started. Restored from the snapshot
+    //    taken before anything ran, so a field added later cannot be missed.
+    safe(() => history.clear());
+    for (const k of Object.keys(st)) delete st[k];
+    Object.assign(st, JSON.parse(JSON.stringify(ST_PRISTINE)));
+
+    // 6. Start again through the existing entry point.
+    boot();
+    toastOk('Extension restarted. The page and your saved files are untouched.');
+  }
+
   /* What a full reset is about to destroy, itemised, so the confirm dialog can
    * state it instead of asking the operator to accept an unspecified loss. */
   function describeSessionContents() {
@@ -671,6 +740,10 @@
    * container instead, which is what keeps panning and zooming alive.
    * =================================================================== */
   let overlayTimer = null, offRender = null;
+  // Held so Hard Reset can stop it; see boot().
+  let reattachTimer = null;
+  // Aborts an in-flight shapefile import when Hard Reset is pressed.
+  let importAbort = null;
 
   function ensureOverlay() {
     let ov = document.getElementById(OVERLAY_ID);
@@ -1857,6 +1930,128 @@
     }
     if (!isFinite(minX)) return;
     safe(() => { if (isFn(A.setCenter)) A.setCenter([(minX + maxX) / 2, (minY + maxY) / 2]); });
+  }
+
+  /* Pick several files at once. A shapefile is a multi-file dataset, so this
+   * is the only import that needs it; readFile stays exactly as it is for the
+   * single-file imports that already use it. */
+  function readFiles(accept, as) {
+    return new Promise((resolve) => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.multiple = true;
+      input.accept = accept || '';
+      input.onchange = async () => {
+        const files = input.files ? Array.from(input.files) : [];
+        if (!files.length) return resolve([]);
+        const out = [];
+        for (const f of files) {
+          const data = await new Promise((res) => {
+            const rd = new FileReader();
+            rd.onload = () => res(rd.result);
+            rd.onerror = () => res(null);
+            if (as === 'text') rd.readAsText(f); else rd.readAsArrayBuffer(f);
+          });
+          if (data != null) out.push({ name: f.name, size: f.size, data });
+        }
+        resolve(out);
+      };
+      input.click();
+    });
+  }
+
+  /* =====================================================================
+   * SHAPEFILE IMPORT
+   * ---------------------------------------------------------------------
+   * One more entry in the Import menu, and nothing else. The parsed result is
+   * the same envelope every other reader produces, so it goes through the
+   * SAME adoptImportedRings — the same CRS question, the same conversion, the
+   * same shapes, the same editing and the same exports. No shapefile-specific
+   * geometry, renderer or editor exists anywhere.
+   *
+   * Two ways in, because both are how shapefiles actually arrive:
+   *   - a ZIP, which is how one is normally sent; unpacked in memory with the
+   *     project's OWN ZIP reader, the one KMZ import already uses.
+   *   - the loose components selected together, for a folder on disk.
+   * Nothing is ever written to the operator's computer, and the source files
+   * are only read.
+   * =================================================================== */
+  async function importShapefileFile() {
+    st.openMenu = null;
+    if (!Shp) return toastErr('The shapefile reader is not loaded. Reopen the digitizer from the toolbar button.');
+
+    let files;
+    try {
+      files = await readFiles('.zip,.shp,.shx,.dbf,.prj,.cpg', 'arrayBuffer');
+    } catch (e) {
+      return toastErr('Those files could not be read.');
+    }
+    if (!files || !files.length) return;
+
+    // Cancellable, so Hard Reset can abandon a large dataset mid-parse.
+    const abort = typeof AbortController === 'function' ? new AbortController() : null;
+    importAbort = abort;
+    const cancelled = () => !!(abort && abort.signal.aborted);
+
+    try {
+      st.busy = true; renderWidget();
+      toast('Reading shapefile…', 'info', 4000);
+
+      let dataset = null;
+      const zip = files.find((f) => /\.zip$/i.test(f.name));
+      if (zip) {
+        const entries = Imp.readZipEntries(new Uint8Array(zip.data));
+        if (!entries.ok) throw new Error('That ZIP could not be opened.');
+        // Entries carry the stored bytes, still deflated. Inflated with the
+        // project's own inflateRaw — the one KMZ import already uses — so
+        // there is no second decompressor to keep correct.
+        const usable = [];
+        for (const e of entries.entries) {
+          if (/\/$/.test(e.name)) continue;
+          if (e.method === 0) { usable.push({ name: e.name, data: e.data }); continue; }
+          if (e.method === 8) {
+            const raw = await Imp.inflateRaw(e.data);
+            if (raw) usable.push({ name: e.name, data: raw });
+            continue;
+          }
+          // An unsupported method is named rather than silently dropped.
+          toast(`"${e.name}" uses compression method ${e.method}, which is not supported, so it was skipped.`, 'warn', 8000);
+        }
+        if (cancelled()) return;
+        const picked = Shp.datasetFromEntries(usable);
+        if (!picked.ok) throw new Error(picked.error);
+        dataset = picked;
+        if (picked.others) {
+          toast(`That ZIP holds ${picked.others + 1} shapefiles; the largest (${picked.name}) was opened.`, 'info', 8000);
+        }
+      } else {
+        // Loose components, grouped by extension exactly as the ZIP path does.
+        const byExt = {};
+        for (const f of files) {
+          const m = String(f.name).match(/\.(shp|shx|dbf|prj|cpg)$/i);
+          if (m) byExt[m[1].toLowerCase()] = new Uint8Array(f.data);
+        }
+        if (!byExt.shp) {
+          throw new Error('Shapefile dataset is incomplete. Select the .zip, or the .shp, .shx, .dbf and .prj files together.');
+        }
+        dataset = Object.assign({ name: files[0].name.replace(/\.[^.]+$/, '') }, byExt);
+      }
+      if (cancelled()) return;
+
+      // parseEpsg is handed in rather than imported: the application has one
+      // projection engine and the reader does not get a second opinion.
+      const result = Shp.parseShapefile(dataset, { parseEpsg: Crs.parseEpsg });
+      if (cancelled()) return;
+      if (!result.ok) throw new Error(result.error);
+
+      adoptImportedRings(result, { what: 'shapefile', name: dataset.name || 'shapefile' });
+    } catch (err) {
+      if (!cancelled()) toastErr(String(err && err.message ? err.message : err));
+    } finally {
+      if (importAbort === abort) importAbort = null;
+      st.busy = false;
+      renderWidget();
+    }
   }
 
   async function importGeometryFile(kind) {
@@ -3553,6 +3748,19 @@ table.coord td:first-child{width:52px}
    * The labels name what they would reverse — "Undo apply translation to 12
    * shape(s)" rather than a bare "Undo" that leaves the operator to discover
    * its effect by pressing it. */
+  /* Hard Reset, deliberately NOT part of the editing bar.
+   *
+   * Those four controls act on the session — undo, redo, remove, wipe. This
+   * one restarts the extension runtime, which is a different kind of thing,
+   * and grouping it with them would both misdescribe it and disturb a set the
+   * brief names and two tests pin exactly. Rendered immediately below them, so
+   * it is still where someone looks when the panel has stopped responding. */
+  function hardResetBarHtml() {
+    return `<div class="bnd15-row" style="margin:0 0 5px">
+      <button class="bnd15-btn sm gray" id="hardReset" title="Restart the extension if it stops responding. Cancels whatever it is doing, releases what it is holding and starts fresh — without reloading the page or touching your saved files. Acts immediately; it does not ask.">⟳ Hard Reset</button>
+    </div>`;
+  }
+
   function historyBarHtml() {
     const u = history.undoLabel();
     const r = history.redoLabel();
@@ -3803,6 +4011,7 @@ table.coord td:first-child{width:52px}
         ${item('gcpImport', 'GCP / control points', 'QGIS .points, or any CSV once you confirm its columns')}
         ${item('iImage', 'Image (scanned sheet)', 'Digitize over a scanned cadastral drawing')}
         ${item('iPdf', 'PDF', 'Pick a PDF file; its pages are rendered by the extension itself, offline')}
+        ${item('iShp', 'Shapefile', 'A zipped shapefile, or the .shp/.shx/.dbf/.prj files selected together')}
       </div>
       <div class="bnd15-menu ${open === 'export' ? 'open' : ''}" id="menuExport">
         <div class="mh">Export</div>
@@ -4272,6 +4481,7 @@ table.coord td:first-child{width:52px}
       ${crsAskHtml()}
       ${csvDialogHtml()}
       ${historyBarHtml()}
+      ${hardResetBarHtml()}
       ${workflowHtml()}
       ${st.plotNo ? `<div class="card"><h4>Selected parcel</h4><div>Plot <b>${esc(st.plotNo)}</b>${st.plotArea ? ` · recorded ${esc(st.plotArea)}` : ''}</div></div>` : ''}
       ${workspaceCardHtml()}
@@ -4639,6 +4849,9 @@ table.coord td:first-child{width:52px}
     on('iGeo', 'onclick', () => importGeometryFile('geojson'));
     on('iImage', 'onclick', () => { st.openMenu = null; openWorkspace('file'); });
     on('iPdf', 'onclick', importPdfFile);
+    on('iShp', 'onclick', importShapefileFile);
+    // No confirm: this is the button for when the panel is wedged.
+    on('hardReset', 'onclick', hardReset);
     on('pdfPrev', 'onclick', () => goToPdfPage((st.pdf ? st.pdf.pageNumber : 1) - 1));
     on('pdfNext', 'onclick', () => goToPdfPage((st.pdf ? st.pdf.pageNumber : 1) + 1));
     on('pdfGo', 'onclick', () => {
@@ -5013,6 +5226,10 @@ table.coord td:first-child{width:52px}
     if (m.type === 'BND15_SHOW_WIDGET') showWidget();
     else if (m.type === 'BND15_TOGGLE_WIDGET') {
       document.getElementById(WIDGET_ID) ? closeWidget() : showWidget();
+    } else if (m.type === 'BND15_HARD_RESET') {
+      // Reachable from the toolbar popup, which is the route that still works
+      // when the panel itself is the thing that has stopped responding.
+      hardReset();
     }
   });
 
@@ -5041,7 +5258,10 @@ table.coord td:first-child{width:52px}
     installGestures();
     document.addEventListener('keydown', onKeyDown, true);
     // The map element can be replaced by the host app; re-attach if so.
-    setInterval(() => { ensureOverlay(); installGestures(); }, 2000);
+    // Held, not fire-and-forget: Hard Reset calls boot() again, and an
+    // untracked interval would stack one more copy on every reset.
+    if (reattachTimer) clearInterval(reattachTimer);
+    reattachTimer = setInterval(() => { ensureOverlay(); installGestures(); }, 2000);
 
     buildWidget();
     reportCount();
