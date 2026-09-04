@@ -141,7 +141,16 @@ function main() {
   const entries = files.map((name) => ({ name, data: new Uint8Array(read(name)) }));
   const bytes = Exp.makeZipBytes(entries);
 
-  const outDir = path.join(ROOT, 'dist');
+  /* dist/ by default, but overridable — because the packaging tests run this
+   * very script, and the archive that was actually submitted to the store is
+   * kept in dist/ under version control. Without this the suite would rewrite
+   * the released bytes on every `npm test`, leaving a 1.9 MB binary
+   * permanently dirty in `git status` and inviting a test rebuild to be
+   * committed over the real submission. The tests point this at a temp
+   * directory; nothing else does. */
+  const outDir = process.env.PACKAGE_OUT_DIR
+    ? path.resolve(process.env.PACKAGE_OUT_DIR)
+    : path.join(ROOT, 'dist');
   fs.mkdirSync(outDir, { recursive: true });
   const outName = `cadastral-digitizer-${manifest.version}.zip`;
   const outPath = path.join(outDir, outName);
@@ -168,7 +177,9 @@ function main() {
     const size = fs.statSync(path.join(ROOT, f)).size;
     console.log(`    ${f.padEnd(width)}  ${kb(size).padStart(9)}   ${why.get(f)}`);
   }
-  console.log(`\n  ${files.length} files -> dist/${outName}  (${kb(bytes.length)})`);
+  // The real path, not a hardcoded "dist/", so a redirected build says where
+  // it actually went.
+  console.log(`\n  ${files.length} files -> ${path.relative(ROOT, outPath) || outPath}  (${kb(bytes.length)})`);
   console.log('  Verified: every declared file present, nothing excluded rode along,');
   console.log('  archive reads back with manifest.json at its root.\n');
   console.log('  Upload at https://chrome.google.com/webstore/devconsole\n');

@@ -11,8 +11,10 @@
 'use strict';
 
 const test = require('node:test');
+const { after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
@@ -24,13 +26,21 @@ const PKG = JSON.parse(read('package.json'));
 const MANIFEST = JSON.parse(read('manifest.json'));
 
 /* Built once and shared: the script is fast, but running it per test would
- * write the same archive five times over. */
+ * write the same archive five times over.
+ *
+ * Built into a TEMP DIRECTORY, not dist/. The archive actually submitted to the
+ * store is kept in dist/ under version control, and a test that rewrites it on
+ * every run would leave a 1.9 MB binary permanently dirty in `git status` — and
+ * sooner or later someone commits a test rebuild over the bytes that were
+ * really uploaded. The script still runs for real; only where it writes moves. */
 let built = null;
+let outDir = null;
 function build() {
   if (built) return built;
+  outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bnd-pkg-'));
   execFileSync(process.execPath, [path.join(ROOT, 'scripts', 'package.js')],
-    { cwd: ROOT, stdio: 'pipe' });
-  const zipPath = path.join(ROOT, 'dist', `cadastral-digitizer-${MANIFEST.version}.zip`);
+    { cwd: ROOT, stdio: 'pipe', env: Object.assign({}, process.env, { PACKAGE_OUT_DIR: outDir }) });
+  const zipPath = path.join(outDir, `cadastral-digitizer-${MANIFEST.version}.zip`);
   assert.ok(fs.existsSync(zipPath), `the package should be written to ${zipPath}`);
   const parsed = Imp.readZipEntries(new Uint8Array(fs.readFileSync(zipPath)));
   assert.strictEqual(parsed.ok, true, 'the archive must be readable');
@@ -100,4 +110,10 @@ test('the package is named for the version it contains, and is a sane size', () 
   // swallowed node_modules, which would be tens of megabytes.
   assert.ok(bytes > 50 * 1024, `suspiciously small package: ${bytes} bytes`);
   assert.ok(bytes < 5 * 1024 * 1024, `package is ${(bytes / 1048576).toFixed(1)} MB — something unwanted got in`);
+});
+
+/* The temp build directory must not outlive the run. Nothing here is left
+ * behind in the repository — that is the whole point of building elsewhere. */
+after(() => {
+  if (outDir) { fs.rmSync(outDir, { recursive: true, force: true }); outDir = null; }
 });
