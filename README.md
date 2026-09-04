@@ -1,4 +1,4 @@
-# Cadastral Digitizer — v17.6.0
+# Cadastral Digitizer — v17.6.1
 
 **Developed by Md Salim Ansari** · MIT licence (see [LICENSE](LICENSE))
 
@@ -9,7 +9,7 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
 **Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store. Submission answers — single purpose, permission justifications, data-usage declarations and a privacy policy — are drafted in [docs/chrome-web-store.md](docs/chrome-web-store.md).
-**Tests:** `npm test` — 681 tests. No install needed: 548 run immediately, and 133 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 686 tests. No install needed: 548 run immediately, and 138 that need a browser skip cleanly. To enable those:
 
 ```bash
 npm install --no-save jsdom            # 80 DOM integration tests
@@ -70,6 +70,19 @@ Imported rings become **ordinary shapes**. Not a separate layer type with its ow
 **The coordinate system is converted when it is known, and asked for when it is not.** See below — this is the distinction the whole import path turns on.
 
 **Unsupported content is skipped with a reason.** A cadastral KMZ routinely carries ground overlays, network links and 3D models; a DXF carries circles and splines with no vertex list. Refusing the whole file over one unreadable placemark is the wrong trade when the other forty parcels are good, so each is counted and named.
+
+### A guest on someone else's page
+
+The panel is injected into a working government portal, so the standard it is held to is that **the site must behave exactly as it did without it**.
+
+Its stylesheet used to be the exception. Rules like `.card`, `.item`, `.list`, `.field`, `.ok` and `.body` went into the page's `<head>` unscoped, so a portal with a `.card` of its own had that card restyled — our border, our padding, our dark palette — and a `.list` of its own picked up `max-height:150px; overflow-y:auto`, clipping the site's content and giving it a scrollbar. Measured against a page built from the class names a Bootstrap-ish portal actually uses: **27 rules reached the host page. Now none do.** Every rule is anchored to `#bnd15-widget`, and a test rebuilds that portal-shaped page and fails if a single rule escapes.
+
+The rest of the contact surface was already deliberate, and is pinned by tests so it stays that way:
+
+- the overlay canvas is **`pointer-events:none`** — every gesture is read from the map container, so the canvas can never swallow a click meant for the site;
+- the keyboard handler **returns immediately** when focus is in an `INPUT`, `TEXTAREA` or `SELECT`, so the portal's own search box keeps Ctrl+Z and Escape;
+- click suppression attaches to the **map container only**, never the document, lasts 700 ms after a tap this tool actually consumed, and has an off switch — so the sidebar, menus and forms never see it;
+- no host element is ever restyled, and the capture path hides only the extension's own four elements.
 
 KMZ inflation uses the platform's `DecompressionStream('deflate-raw')`, present in Chrome and in Node ≥18, rather than bundling an inflate implementation that could not be tested here.
 
@@ -533,7 +546,7 @@ lib/geom_edit.js       move/rotate/scale, the shift record, RF + scale-bar calib
 lib/shapefile.js       ESRI Shapefile reader — .shp / .dbf / .prj, and the ZIP
 vendor/                PDF.js, vendored verbatim (Apache-2.0) — the only third-party
                        code shipped; injected on demand, never fetched
-test/                  681 tests — npm test
+test/                  686 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```

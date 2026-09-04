@@ -2758,3 +2758,141 @@ t('turning off Add missing corners restores the move-only behaviour', async () =
   assert.strictEqual(q(widget, '#sAutoDigInsPx'), null,
     'its dependent dials must disappear with it');
 });
+
+/* =====================================================================
+ * THE HOST PAGE MUST KEEP WORKING  (17.6.1)
+ * ---------------------------------------------------------------------
+ * The extension is a guest on someone else's page. Its stylesheet went into
+ * that page's <head> with rules like `.card`, `.item`, `.list`, `.field`,
+ * `.ok`, `.warn` and `.body` written unscoped — so a portal with a `.card` of
+ * its own had that card restyled: our border, our padding, our dark palette.
+ * `.list` even acquired `max-height:150px;overflow-y:auto`, which would clip
+ * a site's own list and give it a scrollbar.
+ *
+ * Nothing about the extension's own appearance depended on those rules being
+ * global, so the fix is to anchor every one of them to the widget.
+ * =================================================================== */
+
+function widgetStylesheet(src) {
+  const m = src.match(/el\.textContent = `\n([\s\S]*?)`;\n {4}document\.head\.appendChild\(el\)/);
+  assert.ok(m, 'the injected stylesheet must be findable');
+  return m[1].replace(/\$\{WIDGET_ID\}/g, 'bnd15-widget')
+    .replace(/\$\{TOAST_ID\}/g, 'bnd15-toasts')
+    .replace(/\$\{PILL_ID\}/g, 'bnd15-pill')
+    .replace(/\$\{OVERLAY_ID\}/g, 'bnd15-overlay');
+}
+
+function ruleSelectors(css) {
+  const out = [];
+  const re = /([^{}]+)\{[^{}]*\}/g;
+  let m;
+  const clean = css.replace(/\/\*[\s\S]*?\*\//g, ' ');
+  while ((m = re.exec(clean))) {
+    for (const s of m[1].split(',')) { const t = s.trim(); if (t) out.push(t); }
+  }
+  return out;
+}
+
+t('no injected style rule can reach the host page', async () => {
+  // A page shaped like a real government portal: the class names a Bootstrap
+  // -ish site actually uses, which are exactly the ones that collided.
+  const ctx = await boot();
+  const doc = ctx.win.document;
+  const host = doc.createElement('div');
+  host.innerHTML = `<div class="container"><div class="card"><h4>Plot Info</h4>
+    <div class="list"><div class="item"><span class="grow">1890</span>
+      <button class="del">x</button></div></div>
+    <div class="field"><label>Khata</label><input type="text"><select><option>a</option></select></div>
+    <span class="pill">Login</span><span class="ok">ok</span><span class="warn">w</span>
+    <span class="bad">b</span><span class="dim">d</span><span class="mono">4265</span>
+    <div class="status">Ready</div><div class="step">Step 1</div><div class="body">page</div>
+    <div class="capture">c</div><div class="credit">footer</div>
+    <details class="sect"><summary>More</summary><div class="sect-b">x</div></details>
+    <table class="coord"><tr><td>x</td></tr></table>
+    <div class="adv"><div class="adv-t">t</div><div class="adv-b">b</div></div>
+    <div class="csvprev"><table><tr><th>h</th><td>v</td></tr></table></div>
+    <div class="wf"><span class="wf-m">m</span><span class="wf-b">b</span></div></div></div>`;
+  doc.body.appendChild(host);
+
+  const widget = doc.getElementById('bnd15-widget');
+  assert.ok(widget, 'setup: the widget must be present');
+
+  const sels = ruleSelectors(widgetStylesheet(PAGE_SRC));
+  assert.ok(sels.length > 50, `setup: expected the full stylesheet, found ${sels.length} rules`);
+
+  const leaked = [];
+  for (const sel of sels) {
+    let nodes;
+    try { nodes = Array.from(doc.querySelectorAll(sel)); } catch (e) { continue; }
+    // The extension's own elements outside the widget are legitimate targets.
+    const strays = nodes.filter((n) => !widget.contains(n) && n !== widget
+      && !(n.id || '').startsWith('bnd15') && !n.closest('[id^="bnd15"]'));
+    if (strays.length) leaked.push(`${sel} -> ${strays.length}`);
+  }
+  assert.deepStrictEqual(leaked, [],
+    `these rules restyle the host page:\n  ${leaked.join('\n  ')}`);
+});
+
+t('scoping the stylesheet did not cost the widget its own styling', async () => {
+  // The other half of the same change: every rule must still find the element
+  // it was written for. A rule that matches nothing in a fully rendered panel
+  // is one that was over-scoped.
+  const ctx = await withOneShape();
+  click(q(ctx.widget, '#advT'));          // open Settings so its rules have targets
+  await settle(3);
+  const doc = ctx.win.document;
+  const widget = doc.getElementById('bnd15-widget');
+
+  const sels = ruleSelectors(widgetStylesheet(PAGE_SRC));
+  const anchored = sels.filter((s) => s.startsWith('#bnd15-widget'));
+  assert.ok(anchored.length > 50, `expected most rules anchored, got ${anchored.length}`);
+
+  let matching = 0;
+  for (const sel of anchored) {
+    try { if (doc.querySelectorAll(sel).length) matching++; } catch (e) { /* pseudo-element */ }
+  }
+  // Not every rule has a target in one snapshot — some need a CSV dialog or a
+  // failing shape. A large majority matching proves the anchor is right.
+  assert.ok(matching > anchored.length * 0.5,
+    `only ${matching}/${anchored.length} anchored rules found their element — the scope may be wrong`);
+  assert.ok(widget.querySelector('.card'), 'the widget still uses the classes it styles');
+});
+
+t('the extension never restyles an element belonging to the page', async () => {
+  // Beyond CSS: the code must not reach into the host DOM and set styles on it.
+  // withWidgetHidden touches only the extension's own four elements.
+  const src = codeOnly(PAGE_SRC);
+  const fn = src.match(/function withWidgetHidden\([\s\S]*?\n {2}\}/)[0];
+  assert.match(fn, /\[WIDGET_ID, OVERLAY_ID, PILL_ID, TOAST_ID\]/,
+    'only the extension’s own elements may be hidden for a capture');
+  // And the overlay must never intercept a click meant for the site.
+  assert.match(src, /pointer-events:none/,
+    'the overlay canvas must stay click-through');
+  assert.ok(!/getContainer\(\)\.style/.test(src),
+    'the map container must never be restyled');
+});
+
+t('typing in the site’s own inputs is never intercepted', async () => {
+  // The keydown listener is on the document in capture phase, so a portal's
+  // search box would lose Ctrl+Z and Escape without this guard.
+  const fn = codeOnly(PAGE_SRC).match(/function onKeyDown\([\s\S]*?\n {2}\}/)[0];
+  assert.match(fn, /INPUT\|TEXTAREA\|SELECT/,
+    'focus in a form field must return before any shortcut is handled');
+  const guard = fn.indexOf('INPUT|TEXTAREA|SELECT');
+  assert.ok(guard < fn.indexOf("e.key === 'Escape'"),
+    'and it must come first, before any key is acted on');
+});
+
+t('click suppression reaches only the map, and only just after a gesture', async () => {
+  // This is the one thing that could stop the site responding, so its blast
+  // radius is pinned: the map container, for 700ms, after WE consumed a tap.
+  const src = codeOnly(PAGE_SRC);
+  assert.match(src, /host\.addEventListener\(type, swallowSyntheticClick, true\)/,
+    'suppression must attach to the map container, never to the document');
+  assert.ok(!/document\.addEventListener\(\s*'click'/.test(src),
+    'a document-level click swallower would break the whole site');
+  assert.match(src, /suppressUntil = Date\.now\(\) \+ 700/,
+    'and it must expire on its own');
+  assert.match(src, /if \(!S\.blockSiteClicks\) return;/,
+    'with an operator switch to turn it off entirely');
+});
