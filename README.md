@@ -22,6 +22,23 @@ Deliberately not the runner's preinstalled Google Chrome: from **Chrome 137 the 
 
 ---
 
+## What it looks like
+
+| | |
+|---|---|
+| ![The widget on a portal](docs/screenshots/1-widget-on-portal.png) | ![Three parcels traced](docs/screenshots/2-parcels-traced.png) |
+| **Opened on a portal.** The coordinate system is detected and reported with a confidence, not assumed. | **Three parcels traced.** One tap each; every corner already carries a coordinate, and the area is reported as it goes. |
+| ![The import menu](docs/screenshots/3-import-menu.png) | ![A PDF rendered into the workspace](docs/screenshots/4-pdf-imported.png) |
+| **Import.** Existing cadastral geometry from DXF, KMZ/KML, CSV or GeoJSON, a saved project, control points, a scanned image, or a PDF. | **A PDF, rendered by the extension itself** at 2400 px on its long edge — not a screenshot of one. |
+
+![The PDF page selector](docs/screenshots/5-pdf-page-selector.png)
+
+**The page selector for a multi-page PDF.** Only the page you are on is rendered, and turning a page keeps everything you have digitised.
+
+**These are shot against `test/fixtures/stub-map.html`, not a live portal** — a synthetic map with four painted parcels, which is what the end-to-end suite drives. The tracing in them is genuine: real rasterised canvas pixels, real flood fill, the real extension loaded unpacked in Chromium. But the *portal* is a stand-in, and it would be dishonest to present it as a screenshot of the tool working on a government site.
+
+---
+
 ## New in v17
 
 ### One toolbar: Import ▾ · Export ▾ · Save Project
