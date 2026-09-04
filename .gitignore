@@ -14,4 +14,4 @@ package-lock.json
 # rather than tracking every rebuild: a zip does not delta-compress, so every
 # committed build adds its full size to history permanently.
 dist/*
-!dist/cadastral-digitizer-17.3.2.zip
+!dist/cadastral-digitizer-17.3.3.zip
