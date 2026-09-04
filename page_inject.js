@@ -26,7 +26,7 @@
   'use strict';
 
   /* Developed by Md Salim Ansari. MIT licensed — see LICENSE. */
-  const VERSION = '17.3.2';
+  const VERSION = '17.3.3';
   const WIDGET_ID = 'bnd15-widget';
   const STYLE_ID = 'bnd15-style';
   const OVERLAY_ID = 'bnd15-overlay';
@@ -1835,7 +1835,53 @@
     }
 
     if (result.crs && sessionCrs) return { ok: true, crs: sessionCrs, adopted: false };
-    if (sessionCrs) return { ok: true, crs: sessionCrs, adopted: false };
+
+    /* The file states no coordinate system and the session has one.
+     * ------------------------------------------------------------------
+     * Adopting the session's used to be automatic, and that was a
+     * FABRICATION dressed as arithmetic — the same mistake this project
+     * refuses to make about a UTM zone. A DXF routinely carries local drawing
+     * coordinates: a site datum a few hundred units from an arbitrary origin.
+     * Read as eastings and northings those land in the Gulf of Guinea, and the
+     * parcels were overlaid there, at the wrong size, with nothing saying so.
+     *
+     * The numbers cannot say WHICH system they are in — but they can rule one
+     * out. A UTM easting is 100k-900k by the projection's own construction, so
+     * a coordinate of 250 is not one, whatever the session believes. Where the
+     * session's system is provably impossible for these numbers, the import
+     * asks instead of assuming: the same question the app already puts when
+     * neither side knows, and the parsed file is held while it does.
+     *
+     * Only a contradiction blocks it. Anything merely unusual still adopts the
+     * session CRS exactly as before, so no working import changes behaviour.
+     * ------------------------------------------------------------------ */
+    if (sessionCrs) {
+      const samples = [];
+      for (const r of (result.rings || [])) {
+        for (const pt of (r.points || [])) {
+          samples.push(pt);
+          if (samples.length >= 8) break;
+        }
+        if (samples.length >= 8) break;
+      }
+      const fam = samples.length ? safe(() => Crs.classifyFamily(samples), null) : null;
+      const impossible = fam && sessionCrs.kind === 'utm' && fam.family !== 'utm';
+      if (impossible) {
+        return {
+          ok: false,
+          ask: true,
+          note: `${(result.rings || []).length} parcel(s) were read, but their coordinates cannot be `
+            + `${Crs.describeCrs(sessionCrs)} — ${fam.reason}. That usually means the file holds local `
+            + `drawing coordinates rather than survey coordinates. Choose the system the file is really `
+            + `in; if it has none, it needs georeferencing before it can be placed on this map.`,
+          error: `This ${what} states no coordinate system, and its numbers cannot be `
+            + `${Crs.describeCrs(sessionCrs)} — ${fam.reason}. That usually means the file holds `
+            + `local drawing coordinates rather than survey coordinates. Choose the system the file is `
+            + `really in; if it has none, it needs georeferencing before it can be placed on this map.`,
+        };
+      }
+      return { ok: true, crs: sessionCrs, adopted: false };
+    }
     if (result.crs) return { ok: true, crs: result.crs, adopted: true };
     return {
       ok: false,
@@ -1857,7 +1903,7 @@
         // detectCrs offers sixty candidates rather than picking one. The
         // import is HELD rather than thrown away: the operator names the
         // system and it proceeds, instead of having to find the file again.
-        st.crsAsk = { result, opts: o, epsg: '' };
+        st.crsAsk = { result, opts: o, epsg: '', note: crsCheck.note || null };
         renderWidget();
         toast(crsCheck.error, 'warn', 12000);
         return false;
@@ -4205,7 +4251,9 @@ table.coord td:first-child{width:52px}
     const n = a.result.rings.length;
     return `<div class="card" id="crsAsk">
       <h4>Which coordinate system is this file in?</h4>
-      <div class="dim">${n} parcel(s) were read from ${esc(a.opts.what || 'the file')}${a.opts.name ? ` (${esc(a.opts.name)})` : ''}, but neither the file nor this session says what system the numbers are in. A wrong choice puts them hundreds of kilometres out, so it is asked rather than guessed.</div>
+      <div class="dim">${a.note
+        ? esc(a.note)
+        : `${n} parcel(s) were read from ${esc(a.opts.what || 'the file')}${a.opts.name ? ` (${esc(a.opts.name)})` : ''}, but neither the file nor this session says what system the numbers are in. A wrong choice puts them hundreds of kilometres out, so it is asked rather than guessed.`}</div>
       <div class="field" style="margin-top:6px"><span>Coordinates are in</span>
         <select id="crsAskPick">
           <option value="">— choose —</option>

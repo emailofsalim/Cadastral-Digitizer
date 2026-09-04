@@ -1,4 +1,4 @@
-# Cadastral Digitizer — v17.3.2
+# Cadastral Digitizer — v17.3.3
 
 **Developed by Md Salim Ansari** · MIT licence (see [LICENSE](LICENSE))
 
@@ -9,10 +9,10 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
 **Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store. Submission answers — single purpose, permission justifications, data-usage declarations and a privacy policy — are drafted in [docs/chrome-web-store.md](docs/chrome-web-store.md).
-**Tests:** `npm test` — 622 tests. No install needed: 524 run immediately, and 98 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 624 tests. No install needed: 524 run immediately, and 100 that need a browser skip cleanly. To enable those:
 
 ```bash
-npm install --no-save jsdom            # 78 DOM integration tests
+npm install --no-save jsdom            # 80 DOM integration tests
 npm install --no-save playwright-core  # 20 real-Chrome E2E tests (needs a Chrome binary)
 ```
 
@@ -60,6 +60,8 @@ Both menus stay in the DOM when closed and are revealed with a class. That is no
 Imported rings become **ordinary shapes**. Not a separate layer type with its own editor — the same objects a traced parcel produces, so Edit, Move, Clean-up, control points, undo/redo, area calculation and all eight exports work on them with no code path of their own. Supporting import was a reader, not a special case threaded through the application; the same argument the raster workspace made in v16.
 
 **They are overlaid automatically.** Coordinates in the file are used as they are, so a DXF holding real eastings and northings lands where those eastings and northings are, and the *view* moves to the imported extent — never the geometry to the view.
+
+**A file that states no coordinate system is asked about, not assumed into the session's.** This was the real cause of a DXF landing in the wrong place. The import used to adopt the session's coordinate system for any file that declared none — which for a DXF in *local drawing coordinates* meant reading a site datum a few hundred units wide as UTM eastings and northings, and overlaying the parcels at the wrong place and the wrong size with nothing saying so. The numbers cannot say *which* system they are in, but they can rule one out: a UTM easting is 100 000–900 000 by the projection's own construction, so `250` is provably not one. Where the session's system is impossible for the numbers, the import now puts the same question it already asks when neither side knows — and holds the parsed file while it does, so answering finishes the import. Only a **contradiction** blocks it; anything merely unusual still adopts the session CRS exactly as before.
 
 **The view moves only where there is something to look at.** A DXF routinely carries *local drawing* coordinates — a site datum a few hundred units from an arbitrary origin. Read as eastings and northings, `(250, 250)` in UTM 45N is a point on the equator off West Africa, and the import used to pan there: no tiles, blank map, parcels nowhere in sight. The parcels always imported correctly; only the camera was wrong. Now the target is checked against the session's coordinate system with the *existing* CRS engine, and where it does not name a plausible place the view stays put and says why — which is the information you need to fix the CRS.
 
@@ -479,7 +481,7 @@ lib/geom_edit.js       move/rotate/scale, the shift record, RF + scale-bar calib
 lib/shapefile.js       ESRI Shapefile reader — .shp / .dbf / .prj, and the ZIP
 vendor/                PDF.js, vendored verbatim (Apache-2.0) — the only third-party
                        code shipped; injected on demand, never fetched
-test/                  622 tests — npm test
+test/                  624 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```
@@ -518,13 +520,13 @@ Everything in `lib/` is pure — no DOM, no map object — so the code the exten
 
 **A note on settings.** Two settings were found carrying their weight in name only. `showValidityWarnings` had no control and nothing read it — it promised control over behaviour that did not exist, so it is gone; flagging a self-intersecting ring is a correctness signal and not the sort of thing a checkbox should be able to silence. `bboxLeakWarnPct` was likewise dead, but the check it named turned out to be worth building, so it now does what it always claimed. A test asserts that every setting is both read by the code and reachable from the panel, or else appears on a short list of deliberate internals — so a setting cannot quietly become decoration again.
 
-**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 622 every time.
+**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 624 every time.
 
 ---
 
 ## What is verified, and what is not
 
-**Verified by test (622, run with `npm test`):**
+**Verified by test (624, run with `npm test`):**
 
 - **The extension installed in real Chrome.** `test/chrome_e2e.test.js` loads the actual unpacked extension into headless Chrome via Playwright and exercises the parts no simulation can reach:
   - `chrome.scripting.executeScript` with `world: 'MAIN'` really injecting the libraries into the page's own JS world, in the right order — checked by having the *page* look for them.

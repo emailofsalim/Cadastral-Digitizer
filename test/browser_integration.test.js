@@ -1589,7 +1589,11 @@ t('the CRS question names the family it can read, without inventing a zone', asy
   assert.match(PAGE, /function describeImportMagnitude\(/);
   assert.match(PAGE, /cannot say WHICH zone/,
     'the hint must stop short of naming a zone it cannot know');
-  assert.match(PAGE, /st\.crsAsk = \{ result, opts: o, epsg: '' \}/,
+  // Matched on the held fields rather than the whole literal: what this pins is
+  // that the PARSED import is kept, not the exact shape of the object. The
+  // literal has since gained a `note` carrying the reason the question is being
+  // asked, which does not change what is being asserted here.
+  assert.match(PAGE, /st\.crsAsk = \{ result, opts: o, epsg: ''/,
     'the parsed import must be HELD, so answering finishes it rather than restarting');
   assert.match(PAGE, /adoptImportedRings\(held\.result, held\.opts\)/,
     'and answering must resume the same import');
@@ -1892,11 +1896,19 @@ t('auto-focus never reorders the shape collection', async () => {
  * Only the camera move is now conditional. The parcels import either way.
  * =================================================================== */
 
-t('a DXF in local drawing coordinates imports without stranding the map', async () => {
+t('a DXF in local drawing coordinates is asked about, not silently misplaced', async () => {
+  // This test previously asserted the file IMPORTED and only the view was left
+  // alone. That was the shallower fix: the parcels still entered the session
+  // with drawing units read as UTM metres, so they sat on the map at the wrong
+  // place and the wrong size. The real defect was upstream — the import
+  // ADOPTED the session's coordinate system for a file that states none.
+  //
+  // A UTM easting is 100k-900k by the projection's own construction, so 250 is
+  // provably not one. The numbers cannot say which system they ARE in, but
+  // they can rule this one out, and the import now asks rather than assumes.
   const { win, widget } = await boot();
   const centreBefore = win.map.getView().getCenter().slice();
 
-  // Small numbers around an arbitrary origin: an ordinary site drawing.
   const dxf = [
     '0', 'SECTION', '2', 'ENTITIES',
     '0', 'LWPOLYLINE', '8', 'P', '70', '1',
@@ -1912,21 +1924,17 @@ t('a DXF in local drawing coordinates imports without stranding the map', async 
   click(q(widget, '#iDxf'));
   await settle(12);
 
-  // The import still happens — that is the part that was never broken.
-  assert.strictEqual(sessionOrEmpty(win).shapes.length, 1,
-    'the DXF must import exactly as before');
-
-  // But the portal is left where the operator had it, so the basemap is still
-  // under them and they can see what happened.
+  assert.strictEqual(sessionOrEmpty(win).shapes.length, 0,
+    'drawing coordinates must NOT be silently adopted as survey coordinates');
   assert.deepStrictEqual(win.map.getView().getCenter(), centreBefore,
-    'the view must not be panned to a location the coordinates do not really name');
+    'and the portal is left exactly where the operator had it');
 
-  // And they are told, rather than left wondering why the parcels are not
-  // where they expected — the message names the location it worked out.
-  const toasts = win.document.getElementById('bnd15-toasts');
-  assert.match(String(toasts && toasts.textContent),
-    /long way from the map you are on|local drawing coordinates/,
-    'the operator must be told why the view did not move');
+  // The parsed file is held and the question is put, so answering finishes the
+  // import rather than making the operator find the file again.
+  const panel = win.document.getElementById('bnd15-widget').textContent;
+  assert.match(panel, /coordinate system/i, 'the operator must be asked');
+  assert.match(panel, /local drawing coordinates|cannot be/i,
+    `the reason must be stated, not just the refusal: ${panel.slice(0, 400)}`);
 });
 
 t('a DXF in real survey coordinates still moves the view as it always did', async () => {
@@ -1952,4 +1960,44 @@ t('a DXF in real survey coordinates still moves the view as it always did', asyn
   assert.strictEqual(sessionOrEmpty(win).shapes.length, 1);
   assert.notDeepStrictEqual(win.map.getView().getCenter(), centreBefore,
     'a real import must still bring the view to the parcels');
+});
+
+t('a DXF in real survey coordinates is never questioned unnecessarily', async () => {
+  // The guard must only fire on a CONTRADICTION. Numbers that could plausibly
+  // be the session's coordinate system still adopt it silently, exactly as
+  // before — a question the operator does not need is its own kind of damage,
+  // and this is the case that must not regress.
+  const { win, widget } = await boot();
+  const dxf = [
+    '0', 'SECTION', '2', 'ENTITIES',
+    '0', 'LWPOLYLINE', '8', 'P', '70', '1',
+    '10', '432500.25', '20', '2618400.75',
+    '10', '432540.25', '20', '2618400.75',
+    '10', '432540.25', '20', '2618440.75',
+    '0', 'ENDSEC', '0', 'EOF',
+  ].join('\r\n');
+  feedNextFilePicker(win, 'plots.dxf', dxf);
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iDxf'));
+  await settle(12);
+
+  assert.strictEqual(sessionOrEmpty(win).shapes.length, 1,
+    'a plausible import must proceed without a question');
+  assert.ok(!/Which coordinate system is this file in/.test(
+    win.document.getElementById('bnd15-widget').textContent),
+  'and the operator must not be asked about a file that is already consistent');
+});
+
+t('a lon/lat file in a lon/lat session is not blocked by the contradiction guard', async () => {
+  // The guard is narrow by design: it fires only where the session's system is
+  // provably impossible for the numbers. Degree-range coordinates in a
+  // degree-range session are consistent, so nothing should stop them.
+  const C = require('../lib/crs.js');
+  assert.strictEqual(C.classifyFamily([[86.3, 23.6], [86.4, 23.7]]).family, 'geographic');
+  // And the one that matters: small drawing units are provably not UTM.
+  assert.notStrictEqual(C.classifyFamily([[250, 250], [340, 340]]).family, 'utm',
+    'a UTM easting is 100k-900k by construction, so 250 cannot be one');
+  assert.strictEqual(C.classifyFamily([[432500, 2618400], [432540, 2618440]]).family, 'utm',
+    'and real survey coordinates must still classify as UTM');
 });
