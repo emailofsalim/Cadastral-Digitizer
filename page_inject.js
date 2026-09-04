@@ -26,7 +26,7 @@
   'use strict';
 
   /* Developed by Md Salim Ansari. MIT licensed — see LICENSE. */
-  const VERSION = '17.5.0';
+  const VERSION = '17.6.0';
   const WIDGET_ID = 'bnd15-widget';
   const STYLE_ID = 'bnd15-style';
   const OVERLAY_ID = 'bnd15-overlay';
@@ -96,6 +96,27 @@
     // the anti-oscillation rule — re-analysing the same view finds nothing to
     // do, so there is no detect-modify-render-detect loop.
     autoDigitizeSettlePx: 1.5,
+    /* ---- 17.6: adding the corners a shape is missing ------------------ */
+    // Moving corners can only make a polygon a better version of itself; a box
+    // over a parcel with a step in one side has nowhere to put the step. With
+    // this on, the pass probes the middle of each edge and puts a corner where
+    // the boundary measurably leaves the straight line.
+    autoDigitizeInsert: true,
+    // How far off the straight line the boundary must be before a corner is
+    // added. Also the convergence rule: an edge already followed this closely
+    // gets nothing, so a second pass over the same view inserts nothing.
+    autoDigitizeInsertPx: 2.5,
+    // No corner may be planted this near an existing one. Bounds the vertex
+    // density independently of the tolerance above.
+    autoDigitizeMinSpacingPx: 8,
+    // A hard budget per pass, and a hard recursion depth. Between them, even a
+    // pathological raster cannot produce more than a known number of corners.
+    autoDigitizeMaxInsert: 12,
+    autoDigitizeDepth: 3,
+    // Interpolate the crossing between the two samples either side of it,
+    // rather than taking the pixel midpoint. Sub-pixel placement on the soft,
+    // anti-aliased edges a scanned sheet actually has.
+    autoDigitizeSubpixel: true,
     colorTolerance: 40,
     wallLuminanceThreshold: 100,
     simplifyPx: 2.0,
@@ -1538,8 +1559,12 @@
 
   /* Is this a moment when automatic refinement may run at all? Every answer
    * here is "no" by default; the feature has to earn each one. */
-  function autoDigitizeBlocker() {
-    if (!S.autoDigitize) return 'off';
+  function autoDigitizeBlocker(manual) {
+    // The toggle and the zoom floor govern the AUTOMATIC path only. Pressing
+    // the button is an explicit instruction about the view the operator is
+    // looking at, so neither applies — but nothing else is relaxed: no colour,
+    // no selection, unreadable pixels or an edit in progress still refuse.
+    if (!manual && !S.autoDigitize) return 'off';
     const A = st.adapter;
     if (!A) return 'no map';
     if (st.busy) return 'busy';
@@ -1553,6 +1578,7 @@
     const shape = selectedShape();
     if (!shape) return 'no parcel is selected';
     if (isHidden(shape.id)) return 'the selected parcel is hidden';
+    if (manual) return null;
     const z = safe(() => A.getZoom(), null);
     if (z == null) return 'the map zoom is unreadable';
     if (z < (Number(S.autoDigitizeMinZoom) || 18)) return 'zoomed too far out';
@@ -1575,9 +1601,10 @@
   /* One pass over the visible part of the selected parcel. Returns the number
    * of vertices moved, which is 0 far more often than not — and 0 means no
    * commit was made, so an unproductive pass leaves no trace in the history. */
-  function runAutoDigitizePass() {
-    const blocked = autoDigitizeBlocker();
-    if (blocked) return 0;
+  function runAutoDigitizePass(opts) {
+    const o = opts || {};
+    const blocked = autoDigitizeBlocker(o.manual);
+    if (blocked) { if (o.manual) toastErr(`Cannot refine: ${blocked}.`); return 0; }
     const A = st.adapter;
     const shape = selectedShape();
 
@@ -1590,9 +1617,14 @@
     if (!canvas || !canvas.width || !canvas.height) return 0;
     const ctx = safe(() => canvas.getContext('2d', { willReadFrequently: true }), null);
     if (!ctx) return 0;
+    if (!canvas || !ctx) { if (o.manual) toastErr('The map pixels are not available here, so there is nothing to refine against.'); return 0; }
     let img = null;
     try { img = ctx.getImageData(0, 0, canvas.width, canvas.height); }
-    catch (e) { return 0; }          // tainted: not readable, so nothing is done
+    catch (e) {
+      // Tainted: not readable. Browser security is never worked around.
+      if (o.manual) toastErr('This map\u2019s pixels are protected by the browser (cross-origin), so automatic refinement cannot read them here. It works on an imported image or PDF.');
+      return 0;
+    }
     if (!img) return 0;
     const raster = { data: img.data, width: canvas.width, height: canvas.height };
 
@@ -1608,51 +1640,60 @@
     if (ringPx.length < 3) return 0;
 
     const searchPx = Math.max(2, Number(S.autoDigitizeSearchPx) || 12);
-    const opts = {
+    const refineOpts = {
       target: st.pickedColor,
       tolerance: Number(S.colorTolerance) || 40,
       searchPx,
       settlePx: Number(S.autoDigitizeSettlePx) || 1.5,
       minRunPx: 3,
+      subpixel: S.autoDigitizeSubpixel !== false,
+      // Adding corners the shape is missing. Every limit that bounds it is a
+      // setting, so the operator can make it as cautious as the sheet needs.
+      insert: !!S.autoDigitizeInsert,
+      insertTolerancePx: Number(S.autoDigitizeInsertPx) || 2.5,
+      minSpacingPx: Number(S.autoDigitizeMinSpacingPx) || 8,
+      maxInsert: Number(S.autoDigitizeMaxInsert) || 12,
+      maxDepth: Number(S.autoDigitizeDepth) || 3,
     };
 
-    // Collect first, apply after: a pass that finds nothing must not have
-    // touched the shape, and one that finds several must be a single change.
-    const moves = [];
-    for (let i = 0; i < ringPx.length; i++) {
-      const [vx, vy] = ringPx[i];
-      // Only vertices comfortably inside the readable raster are candidates.
-      // A vertex near the edge of the view has half its evidence off screen.
-      if (vx < searchPx || vy < searchPx
-        || vx > raster.width - searchPx - 1 || vy > raster.height - searchPx - 1) continue;
-      const nrm = Tracer.ringVertexNormal(ringPx, i);
-      if (!nrm) continue;
-      const r = Tracer.refineEdgeAlongNormal(raster, vx, vy, nrm[0], nrm[1], opts);
-      if (!r.ok) continue;
-      // Back to map coordinates the same way the trace does it: canvas pixel to
-      // client, client to map. The existing conversion, in the existing CRS.
-      const client = safe(() => A.canvasPixelToClient(vx + r.dx, vy + r.dy), null);
-      const mapPt = client ? safe(() => A.clientToMapCoord(client[0], client[1]), null) : null;
-      if (!mapPt || !isFinite(mapPt[0]) || !isFinite(mapPt[1])) continue;
-      moves.push({ index: i, point: [mapPt[0], mapPt[1]], px: Math.abs(r.offset) });
+    // ONE call over the whole ring, so moving corners and adding them are
+    // decided together against the same pixels rather than in two passes that
+    // could disagree. Nothing is written yet: this returns a new ring.
+    const out = Tracer.refineRingToEdge(raster, ringPx, refineOpts);
+    if (!out.moved && !out.inserted) {
+      if (o.manual) toastOk('Nothing to change — this parcel already follows the picked colour everywhere it is readable in this view.');
+      return 0;
     }
-    if (!moves.length) return 0;
+
+    // Back to map coordinates the same way the trace does it: canvas pixel to
+    // client, client to map. The existing conversion, in the existing CRS.
+    const mapRing = [];
+    for (const px of out.ring) {
+      const client = safe(() => A.canvasPixelToClient(px[0], px[1]), null);
+      const mapPt = client ? safe(() => A.clientToMapCoord(client[0], client[1]), null) : null;
+      // A vertex that will not convert abandons the whole pass rather than
+      // being dropped: a ring missing a corner is worse than one left alone.
+      if (!mapPt || !isFinite(mapPt[0]) || !isFinite(mapPt[1])) return 0;
+      mapRing.push([mapPt[0], mapPt[1]]);
+    }
+    if (mapRing.length < 3) return 0;
+    const moves = { moved: out.moved, inserted: out.inserted };
 
     // ONE history entry for the whole local refinement (§13), taken before
     // anything is written, through the ordinary commit() every manual tool
     // uses — so Undo and Redo need to know nothing about this feature.
     const crossBefore = crossingSnapshot();
-    commit(`refine ${moves.length} corner(s) of shape ${shape.id} from the picked colour`);
+    const what = [];
+    if (moves.moved) what.push(`${moves.moved} corner(s) settled`);
+    if (moves.inserted) what.push(`${moves.inserted} added`);
+    commit(`refine shape ${shape.id} from the picked colour — ${what.join(', ')}`);
     ensureBackup(shape);
-    const pts = shape.points.map((p) => p.slice());
-    for (const m of moves) pts[m.index] = m.point;
-    shape.points = pts;
+    shape.points = mapRing;
     refreshShapeMetrics(shape);
     reportNewCrossings(crossBefore, 'Automatic refinement');
     autosave(); draw(); renderWidget();
-    const far = moves.reduce((a, m) => Math.max(a, m.px), 0);
-    toastOk(`Automatic digitization: ${moves.length} corner(s) settled onto the picked colour, the furthest by ${far.toFixed(1)} px. Ctrl+Z undoes it.`);
-    return moves.length;
+    toastOk(`Auto-fix: ${what.join(' and ')} onto the picked colour. Now ${mapRing.length} corner(s). Ctrl+Z undoes it.`);
+    return moves.moved + moves.inserted;
   }
 
   /* Why nothing is happening, in one line. An automatic feature that silently
@@ -4371,8 +4412,91 @@ table.coord td:first-child{width:52px}
     }).join('');
 
     const current = stages.find((s) => s.active);
-    return section('workflow', 'ℹ️ How this works', rows,
+    return section('workflow', 'ℹ️ How this works', rows + toolGuideHtml(),
       current ? `step ${current.n}` : null);
+  }
+
+  /* =====================================================================
+   * WHAT THE BUTTON YOU PRESSED ACTUALLY DOES
+   * ---------------------------------------------------------------------
+   * The four stages above say what the JOB is. They have said the same thing
+   * since v17, while the toolbar has gained tracing modes, multi-selection,
+   * per-parcel snap and auto-fix — so an operator who pressed one of those had
+   * the workflow explained to them and the tool they were holding not.
+   *
+   * This is the second half: the tool currently selected, what it needs before
+   * it will do anything, and what to press next. It changes with the mode
+   * rather than being a wall of text, because a panel that explains all eleven
+   * tools at once explains none of them.
+   * =================================================================== */
+  function toolGuideHtml() {
+    const sel = selectedShape();
+    const n = selectionIds().length;
+    const colour = st.pickedColor
+      ? `<span class="pill ok">colour picked</span>`
+      : `<span class="pill warn">no colour picked</span>`;
+    const target = n > 1
+      ? `<span class="pill">${n} parcels selected</span>`
+      : (sel ? `<span class="pill">${sel.plotNo ? 'Plot ' + esc(sel.plotNo) : 'Shape ' + sel.id}</span>` : `<span class="pill warn">nothing selected</span>`);
+
+    // [title, body] for whatever is active. Each says what it needs and what
+    // to do next, never merely what it is called.
+    let g;
+    switch (st.mode) {
+      case 'trace':
+        g = ['⚡ Trace — one parcel per tap', `Tap <b>inside</b> a parcel and its outline is found from the pixels.
+          Mode: <b>${st.traceSubmode === 'border' ? 'Border lines' : 'Fill colour'}</b> — ${st.traceSubmode === 'border'
+    ? 'for parcels drawn as outlines with pale interiors.'
+    : 'for parcels filled with a colour wash.'} Switch with the two buttons above.
+          Pan and zoom still work; zoom in first for a cleaner outline.`];
+        break;
+      case 'draw':
+        g = ['✏️ Draw — place the corners yourself', `Tap each corner in turn (<b>${st.drawPoints.length}</b> so far), then <b>✅ Finish</b>.
+          <b>↩ Undo</b> takes back the last corner. Use this where the colours are too similar for Trace to separate parcels.`];
+        break;
+      case 'select':
+        g = ['👆 Select — choose what the Edit tools act on', `Tap a parcel to <b>add</b> it to the selection; tap it again to remove it. Tapping empty space clears everything.
+          Several selected parcels move, rotate and scale <b>together</b>. ${target}`];
+        break;
+      case 'move':
+        g = ['✥ Move Geometry — reposition without redrawing', `Drag a parcel to move it. Dragging one that is <b>already selected</b> moves the whole selection by the same amount; dragging an unselected one moves just that one.
+          The map does not move — only the parcel. ${target}`];
+        break;
+      case 'edit':
+        g = ['✥ Move Vertex — correct one corner', `Drag the white handles. <b>Tap an edge</b> to insert a corner there; <b>Alt+tap</b> a handle to delete one.
+          On a portal that draws parcels off-position, dragging a corner to where it truly belongs also records a control point — that is stage 3 done for free.`];
+        break;
+      case 'gcp':
+        g = ['📍 Control points — for a portal drawn off-position', `Two taps: nominate a corner, then tap where that corner <b>really</b> is. Repeat for a few corners, review the fit, then <b>Apply</b>.
+          Skip this entirely if the parcels are already in the right place.`];
+        break;
+      case 'calibrate':
+        g = ['📏 Scale bar — give the drawing a ground scale', `Tap the two ends of a distance you know on the sheet, then type that distance. Needed only for an image or PDF with no georeferencing.`];
+        break;
+      case 'georef':
+        g = ['🌐 Georeference — pin the sheet to the world', `Tap a point whose real coordinate you know, type the coordinate, repeat for at least two points. Until then, coordinates are image pixels.`];
+        break;
+      default:
+        g = ['Pick a tool', `<b>⚡ Trace</b> one parcel per tap · <b>⚡⚡ Auto-trace</b> every fully-visible parcel at once · <b>✏️ Draw</b> by hand · <b>📥 Import</b> an existing file.
+          Set <b>Fill colour</b> or <b>Border lines</b> first to match how the sheet draws parcels.`];
+    }
+
+    // Auto-fix is not a mode, so it is explained alongside whatever is active —
+    // it is the one tool that needs two things set up before it will act.
+    const autoReady = !!sel && !!st.pickedColor;
+    const auto = `<div class="wf-h" style="margin-top:5px">
+      <b>⚡ Auto-fix boundary</b> (under Edit) — ${autoReady
+    ? `ready. Zoom to a stretch of boundary and press it: corners settle onto the picked colour${S.autoDigitizeInsert ? ', and corners are <b>added</b> where the boundary leaves the straight line' : ' (turn on <i>Add missing corners</i> in Settings to let it add them)'}. Only what is readable on screen changes. One Ctrl+Z undoes it.`
+    : `needs ${!st.pickedColor ? '<b>🎨 Pick</b> pressed on the parcel\u2019s fill colour' : ''}${!st.pickedColor && !sel ? ' and ' : ''}${!sel ? 'a <b>selected</b> parcel' : ''}. ${colour} ${target}`}
+      </div>`;
+
+    return `<div class="wf wf-now" style="border-top:1px solid rgba(148,163,184,.22);margin-top:6px;padding-top:6px">
+      <span class="wf-m">🛠</span>
+      <span class="wf-b"><b>${esc(g[0])}</b>
+        <div class="wf-h">${g[1]}</div>
+        ${auto}
+      </span>
+    </div>`;
   }
 
   /* Undo and redo, named. A button reading "Undo" leaves the operator to find
@@ -4723,6 +4847,17 @@ table.coord td:first-child{width:52px}
         <button class="bnd15-btn sm gray" id="eAddVertex" title="Tap an edge in Move Vertex mode to insert a corner there">Add Vertex</button>
         <button class="bnd15-btn sm gray" id="eDelVertex" title="Alt+tap a corner handle in Move Vertex mode to delete it">Delete Vertex</button>
       </div>
+      <div class="bnd15-row">
+        <button class="bnd15-btn sm orange" id="eAutoFix" ${has && st.pickedColor ? '' : 'disabled'}
+          title="${st.pickedColor
+    ? 'Zoom to a stretch of boundary and press this. The selected parcel\u2019s corners settle onto the picked colour, and corners are ADDED where the boundary leaves the straight line. Only what is readable on screen is touched. One Ctrl+Z undoes it.'
+    : 'Press \ud83c\udfa8 Pick first — the picked colour is what this measures the boundary against.'}">⚡ Auto-fix boundary</button>
+      </div>
+      <div class="dim" style="font-size:10.5px">${!has
+    ? 'Auto-fix needs a selected parcel.'
+    : (!st.pickedColor
+      ? 'Auto-fix needs a picked colour — press <b>🎨 Pick</b> and click the parcel\u2019s fill.'
+      : `Zoom to a boundary, then press <b>Auto-fix</b>. ${S.autoDigitizeInsert ? 'Corners are moved <b>and added</b> where the pixels demand one.' : 'Corners are moved only — turn on <i>Add missing corners</i> in Settings to let it add them.'}`)}</div>
       <div class="dim" style="font-size:10.5px">${!has
     ? 'Nothing selected. Press <b>Select</b> and tap a parcel, or use the Shapes list. Tap more parcels to add them.'
     : (multi > 1
@@ -5186,11 +5321,25 @@ table.coord td:first-child{width:52px}
             <div class="field"><span>Imagery wait (ms)</span><input type="number" id="sWait" min="200" max="10000" step="100" value="${S.imageryWaitMs}"></div>
             <div class="field"><span>Batch: min parcel size (px)</span><input type="number" id="sBatchMin" min="50" step="50" value="${S.batchMinPixels}"></div>
             <div class="field"><span>Batch: max parcels</span><input type="number" id="sBatchMax" min="1" max="1000" value="${S.batchMaxRegions}"></div>
-            <div class="field"><span title="With a parcel selected and a colour picked, zooming in settles that parcel's visible corners onto the picked colour's edge. It only moves existing corners, never adds them, and only when the scan reads one clean boundary — anything ambiguous is left alone. Every change is one Ctrl+Z.">Automatic digitization on zoom</span><input type="checkbox" id="sAutoDig" ${S.autoDigitize ? 'checked' : ''}></div>
-            ${S.autoDigitize ? `<div class="field"><span title="Below this map zoom the feature does nothing at all">Automatic: minimum zoom</span><input type="number" id="sAutoDigZoom" min="1" max="24" step="1" value="${S.autoDigitizeMinZoom}"></div>
-            <div class="field"><span title="How far along the boundary the scan looks — also the largest correction a corner can receive in one pass">Automatic: search (px)</span><input type="number" id="sAutoDigSearch" min="3" max="60" step="1" value="${S.autoDigitizeSearchPx}"></div>
-            <div class="field"><span title="A corner already this close to the detected edge is treated as correct and left alone. This is what stops the same view being refined over and over.">Automatic: settled within (px)</span><input type="number" id="sAutoDigSettle" min="0.1" max="20" step="0.1" value="${S.autoDigitizeSettlePx}"></div>
-            <div class="dim" style="font-size:10.5px">${esc(autoDigitizeStatusLine())}</div>` : ''}
+          </details>
+
+          <details style="margin-top:5px"><summary class="dim" style="cursor:pointer;font-weight:700">Auto-fix boundary</summary>
+            <div class="dim" style="font-size:10.5px;margin-bottom:4px">Measures the selected parcel's boundary against the <b>🎨 Pick</b> colour and corrects it. Run it on demand with <b>⚡ Auto-fix boundary</b> under Edit, or let it run itself as you zoom.</div>
+
+            <div class="field"><span title="Run a pass by itself whenever the view settles at sufficient zoom. Off by default — the Auto-fix button works either way.">Run automatically on zoom</span><input type="checkbox" id="sAutoDig" ${S.autoDigitize ? 'checked' : ''}></div>
+            ${S.autoDigitize ? `<div class="field"><span title="Below this map zoom the automatic pass does nothing at all. The button ignores this.">Minimum zoom (automatic only)</span><input type="number" id="sAutoDigZoom" min="1" max="24" step="1" value="${S.autoDigitizeMinZoom}"></div>` : ''}
+
+            <div class="field"><span title="How far along the boundary the scan looks — also the largest correction a corner can receive in one pass. Raise it when corners start well away from the true edge; lower it on a busy sheet where a neighbouring feature could be caught instead.">Search distance (px)</span><input type="number" id="sAutoDigSearch" min="3" max="60" step="1" value="${S.autoDigitizeSearchPx}"></div>
+            <div class="field"><span title="A corner already this close to the detected edge is treated as correct and left alone. This is what stops the same view being refined over and over.">Corner settled within (px)</span><input type="number" id="sAutoDigSettle" min="0.1" max="20" step="0.1" value="${S.autoDigitizeSettlePx}"></div>
+            <div class="field"><span title="Interpolate between the two samples either side of the boundary instead of taking the nearer pixel centre. Sub-pixel placement on the soft, anti-aliased edges a scanned sheet actually has.">Sub-pixel edge placement</span><input type="checkbox" id="sAutoDigSub" ${S.autoDigitizeSubpixel !== false ? 'checked' : ''}></div>
+
+            <div class="field"><span title="Probe the middle of each edge and add a corner where the boundary measurably leaves the straight line. This is what lets a four-corner box describe a parcel with a step in one side.">Add missing corners</span><input type="checkbox" id="sAutoDigIns" ${S.autoDigitizeInsert ? 'checked' : ''}></div>
+            ${S.autoDigitizeInsert ? `<div class="field"><span title="How far off the straight line the boundary must be before a corner is added. Also the convergence rule: an edge already followed this closely gets nothing, so running it twice adds nothing the second time.">Add corner when off by (px)</span><input type="number" id="sAutoDigInsPx" min="0.5" max="40" step="0.5" value="${S.autoDigitizeInsertPx}"></div>
+            <div class="field"><span title="No corner may be planted this near an existing one. Bounds how dense the outline can become, independently of the tolerance above.">Minimum corner spacing (px)</span><input type="number" id="sAutoDigSpace" min="1" max="100" step="1" value="${S.autoDigitizeMinSpacingPx}"></div>
+            <div class="field"><span title="A hard budget for one pass. Even a pathological raster cannot produce more corners than this.">Max new corners per pass</span><input type="number" id="sAutoDigMaxIns" min="0" max="200" step="1" value="${S.autoDigitizeMaxInsert}"></div>
+            <div class="field"><span title="How many times an edge may be split in half. Each level can double the corners on that edge, so 3 is usually plenty.">Subdivision depth</span><input type="number" id="sAutoDigDepth" min="0" max="8" step="1" value="${S.autoDigitizeDepth}"></div>` : ''}
+
+            <div class="dim" style="font-size:10.5px">${esc(autoDigitizeStatusLine())}</div>
           </details>
 
           <details style="margin-top:5px"><summary class="dim" style="cursor:pointer;font-weight:700">Clean-up</summary>
@@ -5504,6 +5653,20 @@ table.coord td:first-child{width:52px}
     bind('sAutoDigZoom', 'autoDigitizeMinZoom', Number);
     bind('sAutoDigSearch', 'autoDigitizeSearchPx', Number);
     bind('sAutoDigSettle', 'autoDigitizeSettlePx', Number);
+    bind('sAutoDigInsPx', 'autoDigitizeInsertPx', Number);
+    bind('sAutoDigSpace', 'autoDigitizeMinSpacingPx', Number);
+    bind('sAutoDigMaxIns', 'autoDigitizeMaxInsert', Number);
+    bind('sAutoDigDepth', 'autoDigitizeDepth', Number);
+    on('sAutoDigSub', 'onchange', (e) => { S.autoDigitizeSubpixel = e.target.checked; saveSettings(); });
+    on('sAutoDigIns', 'onchange', (e) => {
+      S.autoDigitizeInsert = e.target.checked;
+      saveSettings();
+      renderWidget();
+      toast(S.autoDigitizeInsert
+        ? 'Auto-fix may now ADD corners where the boundary leaves the straight line, not only move the ones already there.'
+        : 'Auto-fix will only move existing corners. The vertex count cannot change.',
+      'info', 6000);
+    });
     on('sShared', 'onchange', (e) => { S.dragSharedCorners = e.target.checked; saveSettings(); });
     on('sWarnCross', 'onchange', (e) => { S.warnNewCrossings = e.target.checked; saveSettings(); });
     on('sAutoGcp', 'onchange', (e) => { S.autoGcpFromEdit = e.target.checked; saveSettings(); });
@@ -5775,6 +5938,12 @@ table.coord td:first-child{width:52px}
       setSelection(selectionIds().filter((id) => id !== shape.id));
       recomputeFit(); autosave(); draw(); renderWidget();
       toastOk(`Shape ${shape.id} deleted. Ctrl+Z undoes it.`);
+    });
+    on('eAutoFix', 'onclick', () => {
+      // An explicit instruction about the view in front of the operator, so it
+      // runs whatever the toggle and the zoom floor say. Every safety refusal
+      // still applies, and it reports what it did — or why it did nothing.
+      runAutoDigitizePass({ manual: true });
     });
     on('eResetShift', 'onclick', () => resetShapeShift(selectedShape()));
     on('eToggleOrig', 'onclick', () => { st.showOriginals = !st.showOriginals; draw(); renderWidget(); });
