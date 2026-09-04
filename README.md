@@ -9,16 +9,16 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
 **Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store. Submission answers — single purpose, permission justifications, data-usage declarations and a privacy policy — are drafted in [docs/chrome-web-store.md](docs/chrome-web-store.md).
-**Tests:** `npm test` — 586 tests. No install needed: 502 run immediately, and 84 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 594 tests. No install needed: 509 run immediately, and 85 that need a browser skip cleanly. To enable those:
 
 ```bash
 npm install --no-save jsdom            # 65 DOM integration tests
-npm install --no-save playwright-core  # 19 real-Chrome E2E tests (needs a Chrome binary)
+npm install --no-save playwright-core  # 20 real-Chrome E2E tests (needs a Chrome binary)
 ```
 
 **CI:** `.github/workflows/test.yml` runs the suite twice on every push and pull request. Once against a **bare checkout with nothing installed**, because "most of it runs the moment you unzip it" is a promise the project makes and a change could quietly break while every other check stayed green; and once with both optional dependencies plus **Playwright's own Chromium**, where **no test may skip** — a silently skipped end-to-end run must not be mistakable for a passing one.
 
-Deliberately not the runner's preinstalled Google Chrome: from **Chrome 137 the stable channel refuses `--load-extension` in headless mode**, so it loads no extension at all — `chrome://extensions` lists zero items, no service worker ever registers, and all nineteen end-to-end tests sit on their timeouts. Measured on Chrome 152; `--headless=new` and `--disable-features=DisableLoadExtensionCommandLineSwitch` were both tried and neither helps. Playwright's build has no such restriction and is the same engine, so nothing is given up.
+Deliberately not the runner's preinstalled Google Chrome: from **Chrome 137 the stable channel refuses `--load-extension` in headless mode**, so it loads no extension at all — `chrome://extensions` lists zero items, no service worker ever registers, and all twenty end-to-end tests sit on their timeouts. Measured on Chrome 152; `--headless=new` and `--disable-features=DisableLoadExtensionCommandLineSwitch` were both tried and neither helps. Playwright's build has no such restriction and is the same engine, so nothing is given up.
 
 ---
 
@@ -135,7 +135,7 @@ Four ways in:
 |---|---|
 | **📂 Image (scanned sheet)** | A scanned sheet or photograph from disk. Full source resolution. |
 | **📄 PDF** | A cadastral sheet as a PDF file. Rendered by the extension itself. |
-| **📸 Capture view** | Any map canvas too cross-origin-protected to read, and PDFs already open in Chrome's own viewer. |
+| **📸 Capture view** | A PDF already open in Chrome's own viewer, and any map you want to digitise as a still image rather than live. |
 | **🖼 Page image** | An image already displayed on the page. |
 
 **How PDFs are read.** You pick the PDF *file*, and the extension rasterises it itself with a vendored copy of [PDF.js](https://mozilla.github.io/pdf.js/) — the same renderer Firefox ships. The page comes out at **2400 px on its long edge**, roughly 200 dpi for an A4 sheet, which is where plot numbers stay legible. From that point on it is an ordinary raster: it goes through the same hand-off a picked image uses, and the workspace never learns a PDF was involved.
@@ -149,7 +149,32 @@ Four ways in:
 - **Plot numbers render even when the sheet does not embed its font.** PDF.js can fetch character maps and standard font data over the network, and this extension configures neither — so whether a sheet using one of the standard 14 fonts came out with blank text was an open question, and on a cadastral drawing the numbers are half of what is being read. Measured rather than assumed: it renders. The one case that would not is text using a predefined CJK character map, which a cadastral sheet does not.
 - **A failed import costs you nothing.** Pick the wrong file by accident and the refusal is all that happens: the sheet you had open stays open, still paginated, still exactly where you left it.
 
-**Capture view is still there**, for two cases the renderer cannot serve: a map canvas too cross-origin-protected to read, and a PDF already open in Chrome's own viewer — PDFium's pixels are unreachable to an extension, so a capture is the only way in. The honest limitation of a capture is that it is **screen** resolution, not source resolution: zoom up first, and take a large sheet in sections. If you have the file, use **📄 PDF** instead.
+**Capture view is still there**, for a PDF already open in Chrome's own viewer — PDFium's pixels are unreachable to an extension, so a capture is the only way in. The honest limitation of a capture is that it is **screen** resolution, not source resolution: zoom up first, and take a large sheet in sections. If you have the file, use **📄 PDF** instead.
+
+It is no longer needed for a *protected map*: that case is now handled automatically — see below.
+
+### Protected maps trace automatically
+
+Many portals draw their basemap from another origin — Google satellite imagery being the usual one. That **taints the map canvas**: the browser refuses to hand its pixels to any script, `getImageData` throws, and colour tracing has nothing to read.
+
+The extension used to stop there and say *"use Draw instead"*. On a sheet of two hundred plots that is not a workaround, it is a refusal.
+
+It now falls back automatically. A raster the extension owns is captured, the **same** tracer runs on that, and the outline comes back through the **portal's own projection** — the live map stays the coordinate authority, so nothing about the resulting geometry is different. Both single-tap Trace and Auto-trace whole view use it, and there is still exactly one tracing engine.
+
+- **Nothing about browser security is weakened.** No CORS workaround, no flags, no changed Chrome settings, no third-party responses touched. The capture uses the same `activeTab` grant the extension already has — **no new permission**.
+- **Detection is technical, not a site list.** The question asked is "can these pixels be read?", so any portal with the same condition gets the same fallback and none is named in the code.
+- **It captures the map, not the browser.** The panel hides itself for the moment of capture and is restored in a `finally`, so a failed capture cannot leave it hidden. The crop follows the map element where the adapter can name it, which keeps batch tracing off the portal's sidebar.
+- **The scale is measured, not assumed.** The ratio between captured pixels and CSS pixels is computed from the capture itself rather than read from `devicePixelRatio`, which is wrong under browser zoom — and a wrong ratio would silently offset every traced vertex.
+
+If the capture genuinely cannot be taken, *then* it says so and Draw remains available.
+
+### Picking an image file
+
+A scanned sheet picked through **Import → Image** is decoded from the **file's bytes**, not by pointing an `<img>` at a URL for it.
+
+That is not a detail. The `<img>` would be created in the *page's* document, so the *page's* Content-Security-Policy decides what it may load — and a portal serving `img-src 'self' data:` blocks a `blob:` URL outright. The bytes are perfectly good; the page simply refuses them, and the browser reports it as a decode error indistinguishable from a corrupt file. That was a real report from the field: an ordinary PNG, refused with *"The browser could not decode that image."*
+
+Reading the bytes has no URL for a policy to filter, and never treats a local path as an HTTP source. Where the engine has no `createImageBitmap` the object-URL path still runs, unchanged, and still hands the URL to the workspace to release when the sheet closes.
 
 Tracing on a raster always samples the image at its **native** resolution regardless of display zoom, so unlike a live map there is no need to zoom in for precision — it is already there. The workspace tells you when you are zoomed out far enough that clicks are no longer pixel-accurate.
 
@@ -413,7 +438,7 @@ lib/importers.js       DXF, KML/KMZ, GeoJSON and CSV readers
 lib/geom_edit.js       move/rotate/scale, the shift record, RF + scale-bar calibration
 vendor/                PDF.js, vendored verbatim (Apache-2.0) — the only third-party
                        code shipped; injected on demand, never fetched
-test/                  586 tests — npm test
+test/                  594 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```
@@ -452,13 +477,13 @@ Everything in `lib/` is pure — no DOM, no map object — so the code the exten
 
 **A note on settings.** Two settings were found carrying their weight in name only. `showValidityWarnings` had no control and nothing read it — it promised control over behaviour that did not exist, so it is gone; flagging a self-intersecting ring is a correctness signal and not the sort of thing a checkbox should be able to silence. `bboxLeakWarnPct` was likewise dead, but the check it named turned out to be worth building, so it now does what it always claimed. A test asserts that every setting is both read by the code and reachable from the panel, or else appears on a short list of deliberate internals — so a setting cannot quietly become decoration again.
 
-**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 586 every time.
+**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 594 every time.
 
 ---
 
 ## What is verified, and what is not
 
-**Verified by test (586, run with `npm test`):**
+**Verified by test (594, run with `npm test`):**
 
 - **The extension installed in real Chrome.** `test/chrome_e2e.test.js` loads the actual unpacked extension into headless Chrome via Playwright and exercises the parts no simulation can reach:
   - `chrome.scripting.executeScript` with `world: 'MAIN'` really injecting the libraries into the page's own JS world, in the right order — checked by having the *page* look for them.

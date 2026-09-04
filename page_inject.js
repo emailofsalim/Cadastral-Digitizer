@@ -1327,7 +1327,8 @@
         }
       }
 
-      const live = A.getCanvas();
+      // `let`, because a protected canvas is swapped for a captured copy below.
+      let live = A.getCanvas();
       // Canvas-pixel mapping comes from the adapter, because it differs by
       // source: a map canvas is scaled by device density, while a raster
       // workspace's canvas IS the image. Computing a density ratio here would
@@ -1343,11 +1344,37 @@
         cy = Math.round(cp[1]);
       }
 
+      // The canvas-pixel -> client mapping belongs to whatever surface is
+      // actually being sampled. It is the adapter's for a readable canvas, and
+      // the capture's when the map is protected; keeping it in one variable is
+      // what lets the fallback reuse the tracing and geometry code untouched.
+      let surfaceToClient = (px, py) => A.canvasPixelToClient(px, py);
+
       let result = null, lastReason = 'Trace failed.';
       for (const size of S.regionSizes) {
-        const got = readRaster(live, cx, cy, size);
+        let got = readRaster(live, cx, cy, size);
+        if (got && got.tainted) {
+          // Not a dead end: the pixels are unreadable HERE, so get a copy the
+          // extension owns and carry on with the same tracer. (brief §9, §10)
+          toast('Protected map detected — preparing a local raster for Colour Trace…', 'info', 4000);
+          const surface = await captureTraceSurface(A);
+          live = surface.canvas;
+          surfaceToClient = surface.toClient;
+          // The seed moves with the surface. Under a zoom boost the map was
+          // recentred on it, so it is the middle of the view; otherwise it is
+          // where the operator actually clicked.
+          const seedClient = restore
+            ? [(window.innerWidth || 0) / 2, (window.innerHeight || 0) / 2]
+            : [clientX, clientY];
+          const sp = surface.clientToPixel(seedClient[0], seedClient[1]);
+          cx = Math.round(sp[0]); cy = Math.round(sp[1]);
+          toast('Local map raster ready — tracing…', 'info', 3000);
+          got = readRaster(live, cx, cy, size);
+          if (got && got.tainted) {
+            throw new Error('Automatic Colour Trace could not capture this map. You can use Draw instead.');
+          }
+        }
         if (!got) { lastReason = 'That point is too close to the edge of the map view.'; continue; }
-        if (got.tainted) throw new Error('The map canvas is cross-origin protected, so its pixels cannot be read. Colour tracing is impossible on this site — use Draw instead.');
         const r = Tracer.traceRegion(got.raster, cx - got.minX, cy - got.minY, {
           submode: st.traceSubmode,
           colorTolerance: S.colorTolerance,
@@ -1369,7 +1396,7 @@
 
       const mapPts = result.r.points
         .map(([px, py]) => {
-          const client = A.canvasPixelToClient(px + result.got.minX, py + result.got.minY);
+          const client = surfaceToClient(px + result.got.minX, py + result.got.minY);
           return client ? A.clientToMapCoord(client[0], client[1]) : null;
         })
         .filter(Boolean);
@@ -1969,6 +1996,75 @@
     });
   }
 
+  /* =====================================================================
+   * PROTECTED-MAP RASTER, for colour tracing
+   * ---------------------------------------------------------------------
+   * Some portals draw their basemap from another origin — Google satellite
+   * imagery being the common one — which taints the map canvas. getImageData
+   * then throws, and colour tracing has no pixels to work with. The extension
+   * used to stop there and tell the operator to draw the parcel by hand, which
+   * on a sheet of two hundred plots is not a workaround, it is a refusal.
+   *
+   * Nothing about the browser's security model needs to be weakened to fix it.
+   * The tab capture the extension already uses for PDFs produces a raster the
+   * EXTENSION owns, so its pixels are readable. That capture is used purely as
+   * a pixel source: the live map stays the adapter, so every coordinate still
+   * comes from the portal's own projection and nothing downstream changes.
+   *
+   * Detection is technical — "can these pixels be read?" — so any site with the
+   * same condition gets the same fallback. No portal is named anywhere in it.
+   * ================================================================== */
+  async function captureTraceSurface(A) {
+    const res = await withWidgetHidden(() => requestTabCapture());
+    if (!res.ok) throw new Error(res.error);
+
+    // Decoded from bytes rather than by pointing an <img> at the data: URL —
+    // the page's Content-Security-Policy governs what its documents may load,
+    // and a restrictive img-src would block the capture for no good reason.
+    const blob = Raster.dataUrlToBlob(res.dataUrl, window);
+    const loaded = blob
+      ? await Raster.loadImageFile(document, blob, window)
+      : await Raster.loadImageSource(document, res.dataUrl);
+    if (!loaded.ok) throw new Error(loaded.error);
+    const shot = loaded.image;
+
+    // captureVisibleTab returns the visible viewport. The ratio between its
+    // pixels and CSS pixels is MEASURED rather than taken from
+    // devicePixelRatio, which is wrong under browser zoom and on mixed-DPI
+    // setups — and a wrong ratio silently offsets every traced vertex.
+    const vw = window.innerWidth || shot.width;
+    const vh = window.innerHeight || shot.height;
+    const sx = shot.width / vw, sy = shot.height / vh;
+
+    // Crop to the map element where the adapter can name it, so batch tracing
+    // vectorises the map rather than the portal's sidebar and toolbars.
+    const el = safe(() => A.getContainer && A.getContainer(), null);
+    const r = el && safe(() => el.getBoundingClientRect(), null);
+    const left = r ? Math.max(0, r.left) : 0;
+    const top = r ? Math.max(0, r.top) : 0;
+    const right = r ? Math.min(vw, r.right) : vw;
+    const bottom = r ? Math.min(vh, r.bottom) : vh;
+    const cw = Math.max(1, Math.round((right - left) * sx));
+    const ch = Math.max(1, Math.round((bottom - top) * sy));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) throw new Error('This browser would not provide a canvas to hold the captured map.');
+    ctx.drawImage(shot.drawable, Math.round(left * sx), Math.round(top * sy), cw, ch, 0, 0, cw, ch);
+    safe(() => shot.drawable.close && shot.drawable.close());
+
+    return {
+      canvas,
+      // Both directions, so the seed point and the traced outline use one
+      // agreed mapping. Client coordinates are what the adapter already
+      // converts to map coordinates, so no new projection is involved.
+      clientToPixel: (cx, cy) => [(cx - left) * sx, (cy - top) * sy],
+      toClient: (px, py) => [left + px / sx, top + py / sy],
+    };
+  }
+
   /* Hide the panel, the overlay and the toasts, run `fn`, then put them back —
    * whatever `fn` does, including throwing. Used for Capture view (brief §22),
    * where the point of the capture is the drawing underneath, not the tool. */
@@ -2010,9 +2106,18 @@
       if (source === 'file') {
         const f = await pickFile('image/*');
         if (!f) { st.busy = false; renderWidget(); return; }
-        url = URL.createObjectURL(f);
-        mintedUrl = url;
-        name = f.name;
+        // Decoded from the File's bytes, not from a URL pointed at it. A URL
+        // puts the load under the PAGE's Content-Security-Policy, which is how
+        // an ordinary PNG ended up reported as undecodable on portals serving
+        // a restrictive img-src. See Raster.loadImageFile.
+        const picked = await Raster.loadImageFile(document, f, window);
+        if (!picked.ok) throw new Error(picked.error);
+        // Only the fallback path mints a URL; the bitmap path has none to own.
+        mintedUrl = picked.objectUrl || null;
+        mountRaster(picked.image, f.name, kind, { objectUrl: mintedUrl });
+        mintedUrl = null;              // ownership transferred
+        toastOk(`${f.name} opened — ${picked.image.width}×${picked.image.height} px. Trace as usual; coordinates are image pixels until you georeference.`);
+        return;                        // the finally below clears busy and repaints
       } else if (source === 'capture') {
         /* CAPTURE VIEW (brief §22). The digitizer hides itself so the capture
          * is of the map or PDF alone rather than of the panel sitting on top of
@@ -2462,14 +2567,28 @@
 
     st.busy = true; renderWidget();
     try {
+      // Same two-path logic as single-tap tracing, and deliberately the same
+      // fallback: one raster acquisition, one auto-trace engine. (brief §17)
+      let surface = canvas;
+      let surfaceToClient = (px, py) => A.canvasPixelToClient(px, py);
       let img;
       try {
-        img = canvas.getContext('2d', { willReadFrequently: true })
-          .getImageData(0, 0, canvas.width, canvas.height);
+        img = surface.getContext('2d', { willReadFrequently: true })
+          .getImageData(0, 0, surface.width, surface.height);
       } catch (e) {
-        throw new Error('The map canvas is cross-origin protected, so its pixels cannot be read on this site.');
+        toast('Protected map detected — preparing a local raster for Colour Trace…', 'info', 4000);
+        const cap = await captureTraceSurface(A);
+        surface = cap.canvas;
+        surfaceToClient = cap.toClient;
+        try {
+          img = surface.getContext('2d', { willReadFrequently: true })
+            .getImageData(0, 0, surface.width, surface.height);
+        } catch (e2) {
+          throw new Error('Automatic Colour Trace could not capture this map. You can use Draw instead.');
+        }
+        toast('Local map raster ready — tracing…', 'info', 3000);
       }
-      const raster = { data: img.data, width: canvas.width, height: canvas.height };
+      const raster = { data: img.data, width: surface.width, height: surface.height };
 
       const res = Tracer.findAllRegions(raster, {
         submode: st.traceSubmode,
@@ -2487,7 +2606,7 @@
       for (const region of res.regions) {
         const pts = region.points
           .map(([px, py]) => {
-            const client = A.canvasPixelToClient(px, py);
+            const client = surfaceToClient(px, py);
             return client ? A.clientToMapCoord(client[0], client[1]) : null;
           })
           .filter(Boolean);

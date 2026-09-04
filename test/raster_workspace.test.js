@@ -459,3 +459,141 @@ test('a PDF is recognised by url, content type or embed', () => {
 
   assert.strictEqual(R.looksLikePdf(makeDoc(store), makeWin()), false);
 });
+
+/* =====================================================================
+ * PICKING AN IMAGE FILE
+ * ---------------------------------------------------------------------
+ * The bug these exist to prevent, reported from the field: an ordinary PNG
+ * picked through Import → Image was refused with "The browser could not decode
+ * that image." The file was fine. The import pointed an <img> in the PAGE's
+ * document at a blob: URL, so the PAGE's Content-Security-Policy decided
+ * whether it could load — and a portal serving a restrictive img-src simply
+ * refused. Reading the File's bytes instead has no URL for a policy to filter.
+ * =================================================================== */
+
+function fakeFile(name, type, bytes) {
+  return { name, type, size: (bytes || 8), __bytes: bytes };
+}
+
+/* A window that can decode bytes, as every current browser can. */
+function winWithBitmap(store) {
+  return {
+    createImageBitmap: async (blob) => {
+      store.decoded.push(blob);
+      if (blob && blob.__fail) throw new Error('decode failed');
+      // `in`, not a truthiness check: a zero-sized bitmap is the case under test.
+      const w = blob && '__w' in blob ? blob.__w : 1200;
+      const h = blob && '__h' in blob ? blob.__h : 900;
+      return { width: w, height: h, close() { store.closed++; } };
+    },
+    URL: {
+      createObjectURL: (b) => { store.minted++; store.live.add('blob:' + store.minted); return 'blob:' + store.minted; },
+      revokeObjectURL: (u) => { store.live.delete(u); },
+    },
+    atob: (s) => Buffer.from(s, 'base64').toString('binary'),
+  };
+}
+
+/* And one that cannot, so the object-URL path is still exercised. */
+function winWithoutBitmap(store) {
+  const w = winWithBitmap(store);
+  delete w.createImageBitmap;
+  return w;
+}
+
+function newStore() { return { decoded: [], minted: 0, closed: 0, live: new Set() }; }
+
+/* A document whose <img> resolves or fails as the test dictates. */
+function docWithImg(outcome, dims) {
+  return {
+    createElement() {
+      const el = {};
+      Object.defineProperty(el, 'src', {
+        set() {
+          setImmediate(() => {
+            if (outcome === 'ok') {
+              el.naturalWidth = dims ? dims[0] : 640;
+              el.naturalHeight = dims ? dims[1] : 480;
+              el.onload();
+            } else el.onerror();
+          });
+        },
+      });
+      return el;
+    },
+  };
+}
+
+test('a picked image is decoded from its BYTES, with no URL for a page policy to block', async () => {
+  const store = newStore();
+  const r = await R.loadImageFile(docWithImg('ok'), fakeFile('sheet.png', 'image/png'), winWithBitmap(store));
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.image.width, 1200);
+  assert.strictEqual(r.image.height, 900);
+  assert.strictEqual(store.decoded.length, 1, 'the File itself must be handed to the decoder');
+  // The point of the fix: nothing was minted, so no page CSP could refuse it.
+  assert.strictEqual(store.minted, 0, 'the byte path must not create an object URL at all');
+  assert.strictEqual(r.objectUrl, null, 'and there is none for the caller to own');
+});
+
+test('where bytes cannot be decoded directly, the object-URL path still works', async () => {
+  // Older engines, and the jsdom the DOM suite runs in, have no
+  // createImageBitmap. That path is a fallback, not a casualty.
+  const store = newStore();
+  const r = await R.loadImageFile(docWithImg('ok', [800, 600]), fakeFile('sheet.jpg', 'image/jpeg'), winWithoutBitmap(store));
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.image.width, 800);
+  assert.strictEqual(store.minted, 1);
+  assert.strictEqual(r.objectUrl, 'blob:1', 'the caller owns the URL, exactly as before');
+  assert.strictEqual(store.live.has('blob:1'), true, 'and it is NOT revoked while the image is still in use');
+});
+
+test('a decode that genuinely fails releases what it minted and says something useful', async () => {
+  const store = newStore();
+  const r = await R.loadImageFile(docWithImg('error'), fakeFile('broken.png', 'image/png'), winWithoutBitmap(store));
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /broken\.png/, 'the message should name the file');
+  assert.match(r.error, /damaged|does not read/i);
+  assert.strictEqual(store.live.size, 0, 'a failed import must not pin the file in memory');
+  assert.strictEqual(r.objectUrl, null);
+});
+
+test('a file that is not an image is refused before any decoding is attempted', async () => {
+  const store = newStore();
+  const r = await R.loadImageFile(docWithImg('ok'), fakeFile('parcels.dxf', 'application/dxf'), winWithBitmap(store));
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /not an image/);
+  assert.strictEqual(store.decoded.length, 0);
+});
+
+test('a wrong MIME type does not veto a file the name says is an image', async () => {
+  // Files arriving by email or a messaging app routinely carry the wrong type,
+  // and refusing them would be this tool's bug rather than the file's.
+  const store = newStore();
+  const r = await R.loadImageFile(docWithImg('ok'), fakeFile('scan.JPG', 'application/octet-stream'), winWithBitmap(store));
+  assert.strictEqual(r.ok, true, r.error);
+});
+
+test('a decoder that returns nothing usable falls through rather than mounting an empty sheet', async () => {
+  const store = newStore();
+  const blob = fakeFile('zero.png', 'image/png');
+  blob.__w = 0; blob.__h = 0;
+  const r = await R.loadImageFile(docWithImg('ok', [500, 400]), blob, winWithBitmap(store));
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.image.width, 500, 'the object-URL path should have rescued it');
+});
+
+test('a data URL becomes bytes without going back through the page', async () => {
+  // The capture arrives as a data: URL. Decoding it via an <img> would put it
+  // under the same Content-Security-Policy the byte path exists to avoid.
+  const store = newStore();
+  const png = Buffer.from('hello world').toString('base64');
+  const blob = R.dataUrlToBlob(`data:image/png;base64,${png}`, winWithBitmap(store));
+  assert.ok(blob, 'a base64 data URL must convert');
+  assert.strictEqual(blob.type, 'image/png');
+  assert.strictEqual(blob.size, 'hello world'.length);
+
+  assert.strictEqual(R.dataUrlToBlob('', winWithBitmap(store)), null);
+  assert.strictEqual(R.dataUrlToBlob('data:image/png,notbase64', winWithBitmap(store)), null);
+  assert.strictEqual(R.dataUrlToBlob('nonsense', winWithBitmap(store)), null);
+});

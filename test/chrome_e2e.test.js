@@ -176,6 +176,13 @@ after(async () => {
     fixtureServer = null;
     fixtureOrigin = null;
   }
+  // The second origin used by the tainted-canvas test. A listening socket left
+  // open does not slow the runner down, it hangs it forever.
+  if (taintServer) {
+    await new Promise((resolve) => taintServer.close(resolve));
+    taintServer = null;
+    taintOrigin = null;
+  }
   if (tmpRoot) { try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (e) { /* ignore */ } }
 });
 
@@ -937,6 +944,89 @@ t('importing repeatedly replaces the sheet each time and leaves nothing behind',
   // than stacking another element with the same id on top of it.
   const containers = await page.$$eval('[id="bnd15-raster-workspace"]', (els) => els.length);
   assert.strictEqual(containers, 1, `three imports left ${containers} workspaces behind`);
+});
+
+/* =====================================================================
+ * A PROTECTED (CROSS-ORIGIN TAINTED) MAP CANVAS
+ *
+ * Reported from the field on a state cadastral portal: the basemap is served
+ * from another origin, which taints the map canvas, so getImageData throws and
+ * colour tracing had nothing to read. The extension used to stop there and tell
+ * the operator to draw two hundred plots by hand.
+ *
+ * The taint here is REAL, not simulated: a second HTTP server on a different
+ * port serves an image, the fixture draws it onto its canvas, and Chrome marks
+ * the canvas origin-unclean exactly as a portal's basemap does. Nothing about
+ * browser security is weakened to get past it — the extension captures a raster
+ * it owns and traces that instead.
+ * =================================================================== */
+
+let taintServer = null, taintOrigin = null;
+
+/* A different ORIGIN, which on the same host means a different port. */
+async function taintedOrigin() {
+  if (taintOrigin) return taintOrigin;
+  // A 2x2 PNG. Its content does not matter; drawing it is what taints.
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFElEQVR4nGP8//8/AzJgYkAD'
+    + 'IxcAAP//AwwBBQAA//8DDAEFAAAAAElFTkSuQmCC', 'base64');
+  taintServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'image/png' });
+    res.end(png);
+  });
+  await new Promise((resolve) => taintServer.listen(0, '127.0.0.1', resolve));
+  taintServer.unref();
+  taintOrigin = `http://127.0.0.1:${taintServer.address().port}`;
+  return taintOrigin;
+}
+
+t('a cross-origin protected map is traced through a captured raster, not refused', async () => {
+  const { page } = await openFixtureWithExtension();
+  const other = await taintedOrigin();
+
+  // Taint the fixture's canvas for real, and confirm it: a test that silently
+  // failed to taint would pass while proving nothing.
+  const tainted = await page.evaluate(async (origin) => {
+    const c = document.getElementById('c');
+    const ctx = c.getContext('2d');
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve; img.onerror = reject;
+      img.src = `${origin}/pixel.png?${Date.now()}`;
+    });
+    // Stretched over one corner so the parcels underneath stay traceable.
+    ctx.drawImage(img, 0, 0, 20, 20);
+    try { ctx.getImageData(0, 0, 2, 2); return false; } catch (e) { return true; }
+  }, other);
+  assert.strictEqual(tainted, true, 'the fixture canvas must actually be origin-unclean for this test to mean anything');
+
+  // Now trace, exactly as an operator does.
+  await page.click('#bnd15-widget #mTrace');
+  const box = await page.evaluate(() => window.__PARCELS__[0]);
+  const rect = await page.$eval('#map', (el) => {
+    const r = el.getBoundingClientRect();
+    return { left: r.left, top: r.top };
+  });
+  await page.mouse.click(rect.left + box.x + box.w / 2, rect.top + box.y + box.h / 2);
+
+  await page.waitForFunction(
+    () => /Shape 1/.test(document.querySelector('#bnd15-widget').textContent),
+    null, { timeout: 30000 });
+
+  const text = await page.textContent('#bnd15-widget');
+  assert.ok(!/use Draw instead/.test(text),
+    `a protected canvas must no longer end in a refusal: ${text.slice(0, 300)}`);
+
+  // The geometry must be RIGHT, not merely present. The captured raster is at
+  // device pixels over the whole viewport; if that mapping back to map
+  // coordinates were wrong, the parcel would still appear but in the wrong
+  // place and the wrong size. The fixture paints a 300x200 px parcel whose
+  // ground area is known, so the area is the check.
+  const m = text.match(/Shape 1 · (\d+)v · (\d+) m²/);
+  assert.ok(m, `the traced shape should report vertices and an area: ${text.slice(0, 300)}`);
+  const area = Number(m[2]);
+  assert.ok(area > 15000 * 0.9 && area < 15000 * 1.1,
+    `traced through the capture the parcel should still measure ~15,000 m²; got ${area}`);
 });
 
 /* =====================================================================
