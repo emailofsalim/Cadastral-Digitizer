@@ -16,3 +16,4 @@ package-lock.json
 dist/*
 !dist/cadastral-digitizer-17.3.3.zip
 !dist/cadastral-digitizer-17.3.4.zip
+!dist/cadastral-digitizer-17.4.0.zip

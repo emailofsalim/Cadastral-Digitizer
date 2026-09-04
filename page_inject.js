@@ -26,7 +26,7 @@
   'use strict';
 
   /* Developed by Md Salim Ansari. MIT licensed — see LICENSE. */
-  const VERSION = '17.3.4';
+  const VERSION = '17.4.0';
   const WIDGET_ID = 'bnd15-widget';
   const STYLE_ID = 'bnd15-style';
   const OVERLAY_ID = 'bnd15-overlay';
@@ -233,6 +233,15 @@
     // The parcel every Edit operation acts on. Distinct from editShapeId,
     // which additionally means "show this shape's vertex handles".
     selectedShapeId: null,
+    /* ---- added in 17.4 ---------------------------------------------- */
+    // Every selected parcel, in the order they were selected. selectedShapeId
+    // above is the LAST of them — the anchor — and is deliberately kept as the
+    // single source for the tools that are meaningful on one parcel at a time
+    // (vertex editing, Copy, Duplicate, Delete). Nothing that read
+    // selectedShapeId before this existed had to change: with one parcel
+    // selected the two agree exactly, which is what keeps every existing
+    // single-parcel behaviour identical.
+    selectedShapeIds: [],
     // Drawing scale for a raster sheet: RF or scale bar (brief §12, §13).
     // Never read from or written by the viewport — screen zoom and drawing
     // scale are different things (brief §26).
@@ -511,7 +520,7 @@
     // the file: a stored fit could disagree with the geometry it claims to
     // describe if either were edited by hand.
     recomputeGeoref();
-    st.selectedShapeId = null;
+    clearSelection();
     return true;
   }
 
@@ -597,7 +606,7 @@
     st.gcpStage = 'pickVertex'; st.gcpSelection = null;
     st.drawPoints = []; st.drawUndo = []; st.drawRedo = [];
     st.editShapeId = null;
-    st.selectedShapeId = null;
+    clearSelection();
     st.quality = null;
     st.lastWarning = null;
     st.mode = 'idle';
@@ -857,7 +866,7 @@
       // collection, still selectable from the list, still exported.
       if (isHidden(shape.id)) continue;
       const editing = st.editShapeId === shape.id;
-      const selected = st.selectedShapeId === shape.id;
+      const selected = isSelected(shape.id);
       const pts = shape.points.map(toOverlayPx).filter(Boolean);
       if (pts.length < 2) continue;
       ctx.beginPath();
@@ -931,7 +940,7 @@
     if (st.showOriginals) {
       for (const shape of st.shapes) {
         const orig = st.backups[shape.id];
-        if (!orig || (st.selectedShapeId != null && st.selectedShapeId !== shape.id)) continue;
+        if (!orig || (st.selectedShapeId != null && !isSelected(shape.id))) continue;
         const pts = orig.map(toOverlayPx).filter(Boolean);
         if (pts.length < 3) continue;
         ctx.save();
@@ -1146,12 +1155,28 @@
         const shape = findShape(grab.shapeId);
         const start = st.adapter.clientToMapCoord(e.clientX, e.clientY);
         if (!shape || !start) { gesture.drag = null; return; }
-        st.selectedShapeId = shape.id;
+        // Dragging a parcel that is ALREADY selected moves the whole selection;
+        // dragging one that is not selects just it, which is the single-parcel
+        // behaviour unchanged. That distinction is deliberate: it is the only
+        // thing standing between a stale selection from ten minutes ago and an
+        // accidental group move.
+        if (!isSelected(shape.id)) setSelection([shape.id]);
+        const group = selectedShapes();
         grab.start = start;
         grab.origin = shape.points.map((p) => p.slice());
+        // Every selected parcel's pre-drag ring, so each frame is recomputed
+        // from where they started rather than accumulated — the same reason the
+        // single-parcel drag keeps `origin`, applied to the group.
+        grab.groupIds = group.map((s) => s.id);
+        grab.groupOrigins = group.map((s) => s.points.map((p) => p.slice()));
         grab.crossBefore = crossingSnapshot();
         gesture.drag = grab;
-        commit(`move shape ${shape.id}`);
+        // Committed at pointer-DOWN, before a single point moves: the pre-drag
+        // rings are what undo has to restore. Spelled out rather than folded
+        // into a ternary so the single-parcel commit stays literally the
+        // statement it always was.
+        if (group.length > 1) commit(`move ${group.length} parcels together`);
+        else commit(`move shape ${shape.id}`);
         e.stopPropagation();
         e.preventDefault();
         draw();
@@ -1198,13 +1223,18 @@
       // The whole parcel follows the pointer. Recomputed from the ORIGINAL
       // ring and the total pointer delta each frame rather than accumulated
       // per-frame, so rounding cannot creep in over a long drag.
-      const shape = findShape(gesture.drag.shapeId);
-      if (shape) {
-        const dx = pt[0] - gesture.drag.start[0];
-        const dy = pt[1] - gesture.drag.start[1];
-        shape.points = gesture.drag.origin.map((p) => [p[0] + dx, p[1] + dy]);
-        gesture.drag.delta = [dx, dy];
+      const dx = pt[0] - gesture.drag.start[0];
+      const dy = pt[1] - gesture.drag.start[1];
+      // ONE delta, computed once from the pointer, applied to every parcel in
+      // the group. Nothing is measured per-parcel, so they cannot drift apart:
+      // relative spacing, shape and orientation are preserved by construction.
+      const ids = gesture.drag.groupIds || [gesture.drag.shapeId];
+      const origins = gesture.drag.groupOrigins || [gesture.drag.origin];
+      for (let i = 0; i < ids.length; i++) {
+        const s = findShape(ids[i]);
+        if (s && origins[i]) s.points = origins[i].map((p) => [p[0] + dx, p[1] + dy]);
       }
+      gesture.drag.delta = [dx, dy];
     } else {
       const shape = findShape(gesture.drag.shapeId);
       if (shape) shape.points[gesture.drag.index] = pt;
@@ -1241,20 +1271,32 @@
       if (!g.moved) dropCommit();
       if (g.drag.kind === 'gcp') { recomputeFit(); }
       else if (g.drag.kind === 'shape') {
-        const shape = findShape(g.drag.shapeId);
-        if (shape && g.moved && g.drag.delta) {
-          // The drag already moved the points; this records WHAT was done so
-          // the correction stays reviewable and resettable (brief §4). The
-          // backup captures the pre-drag ring, not the mid-drag one.
-          if (!st.backups[shape.id]) st.backups[shape.id] = g.drag.origin.map((p) => p.slice());
-          shape.shift = GeomEdit.composeShift(shape.shift || GeomEdit.identityShift(),
-            GeomEdit.shiftForTranslation(g.drag.delta[0], g.drag.delta[1]));
-          refreshShapeMetrics(shape);
-          reportNewCrossings(g.drag.crossBefore, 'Moving that parcel');
+        const ids = g.drag.groupIds || [g.drag.shapeId];
+        const origins = g.drag.groupOrigins || [g.drag.origin];
+        const moved = [];
+        for (let i = 0; i < ids.length; i++) {
+          const s = findShape(ids[i]);
+          if (!s) continue;
+          if (g.moved && g.drag.delta) {
+            // The drag already moved the points; this records WHAT was done so
+            // the correction stays reviewable and resettable (brief §4). The
+            // backup captures the pre-drag ring, not the mid-drag one — and
+            // each parcel keeps its OWN record, so a group move is still
+            // resettable one parcel at a time.
+            if (!st.backups[s.id] && origins[i]) st.backups[s.id] = origins[i].map((p) => p.slice());
+            s.shift = GeomEdit.composeShift(s.shift || GeomEdit.identityShift(),
+              GeomEdit.shiftForTranslation(g.drag.delta[0], g.drag.delta[1]));
+            moved.push(s);
+          }
+          refreshShapeMetrics(s);
+        }
+        if (moved.length) {
+          reportNewCrossings(g.drag.crossBefore, moved.length > 1 ? 'Moving those parcels' : 'Moving that parcel');
           const d = Math.hypot(g.drag.delta[0], g.drag.delta[1]);
-          toastOk(`Shape ${shape.id} moved ${d.toFixed(2)} ${areaUnit() === 'px²' ? 'px' : 'm'}. Ctrl+Z undoes it; ↺ resets it completely.`);
-        } else if (shape) {
-          refreshShapeMetrics(shape);
+          const u = areaUnit() === 'px²' ? 'px' : 'm';
+          toastOk(moved.length > 1
+            ? `${moved.length} parcels moved ${d.toFixed(2)} ${u} together — same delta each, so their relative positions are unchanged. Ctrl+Z undoes it.`
+            : `Shape ${moved[0].id} moved ${d.toFixed(2)} ${u}. Ctrl+Z undoes it; ↺ resets it completely.`);
         }
       } else {
         const shape = findShape(g.drag.shapeId);
@@ -1343,13 +1385,23 @@
       // rule the rest of the tool follows.
       const shape = hitTestShapeBody(clientX, clientY);
       if (!shape) {
-        st.selectedShapeId = null;
+        clearSelection();
         draw(); renderWidget();
-        return toast('No parcel there. Tap inside a boundary to select it.', 'info', 3000);
+        return toast('No parcel there. Tap inside a boundary to select it. Tapping empty space clears the selection.', 'info', 3000);
       }
-      st.selectedShapeId = shape.id;
+      // Tapping ADDS to the selection, and tapping a selected parcel takes it
+      // back out. Several parcels can therefore be gathered up and moved as one
+      // without a modifier key, which a field laptop with a trackpad makes
+      // awkward. What was selected is always said out loud, because a group
+      // move is only safe if its membership is never a surprise.
+      const what = toggleSelection(shape.id);
+      const n = selectionIds().length;
+      const name = shape.plotNo ? 'plot ' + shape.plotNo : 'shape ' + shape.id;
       draw(); renderWidget();
-      toast(`Selected ${shape.plotNo ? 'plot ' + shape.plotNo : 'shape ' + shape.id} — ${shape.points.length} corners, ${(shape.areaM2 || 0).toFixed(1)} ${areaUnit()}.`, 'info', 3500);
+      toast(what === 'removed'
+        ? `Deselected ${name}. ${n} parcel(s) still selected.`
+        : `Selected ${name} — ${shape.points.length} corners, ${(shape.areaM2 || 0).toFixed(1)} ${areaUnit()}.${n > 1 ? ` ${n} parcels selected; they move together.` : ''}`,
+      'info', 3500);
     } else if (st.mode === 'gcp') {
       if (st.gcpStage === 'placeTarget') {
         captureGcpTarget(clientX, clientY);
@@ -1625,6 +1677,135 @@
     return findShape(st.selectedShapeId);
   }
 
+  /* =====================================================================
+   * SELECTING MORE THAN ONE PARCEL  (17.4)
+   * ---------------------------------------------------------------------
+   * A group move is one operator gesture, so it has to be one selection.
+   *
+   * The set is kept ALONGSIDE selectedShapeId rather than replacing it. The
+   * anchor is the last parcel selected, and with a single selection the two
+   * are the same id — so every tool written against selectedShapeId behaves
+   * exactly as it did, and only the transforms that are genuinely group
+   * operations read the set. Vertex editing, Copy, Duplicate and Delete stay
+   * deliberately single: they are not translations, and silently applying
+   * them to a group is how parcels get lost.
+   *
+   * Ids, never object references: a parcel that is deleted, reloaded from a
+   * project or replaced by an import must not be able to linger in the
+   * selection as a detached copy. Every read filters against st.shapes.
+   * =================================================================== */
+  function selectionIds() {
+    const live = new Set(st.shapes.map((s) => s.id));
+    const seen = new Set();
+    const out = [];
+    for (const id of (st.selectedShapeIds || [])) {
+      if (live.has(id) && !seen.has(id)) { seen.add(id); out.push(id); }
+    }
+    return out;
+  }
+
+  function selectedShapes() {
+    const ids = selectionIds();
+    return ids.map((id) => findShape(id)).filter(Boolean);
+  }
+
+  function isSelected(id) {
+    return (st.selectedShapeIds || []).indexOf(id) !== -1;
+  }
+
+  /* The one place the two pieces of state are written, so they cannot drift:
+   * the anchor is always the last id in the set, and an empty set always means
+   * a null anchor. */
+  function setSelection(ids) {
+    const live = new Set(st.shapes.map((s) => s.id));
+    const seen = new Set();
+    const out = [];
+    for (const id of (ids || [])) {
+      if (live.has(id) && !seen.has(id)) { seen.add(id); out.push(id); }
+    }
+    st.selectedShapeIds = out;
+    st.selectedShapeId = out.length ? out[out.length - 1] : null;
+  }
+
+  function clearSelection() { setSelection([]); }
+
+  /* Add a parcel, or remove it if it is already in the selection. Returns what
+   * happened so the caller can say so — a selection that changes silently is
+   * how the wrong parcels get moved. */
+  function toggleSelection(id) {
+    const ids = selectionIds();
+    const at = ids.indexOf(id);
+    if (at === -1) { ids.push(id); setSelection(ids); return 'added'; }
+    ids.splice(at, 1);
+    setSelection(ids);
+    return 'removed';
+  }
+
+  /* One common origin for a group rotation or scaling: the centre of the
+   * bounding box of every selected vertex. Chosen over an area-weighted
+   * centroid because it is the same point whichever parcel happens to be the
+   * anchor and whatever order they were selected in — a group transform that
+   * moved depending on click order would be unusable. A SINGLE selection never
+   * reaches this: it keeps its own centroid, exactly as before. */
+  function selectionOrigin(shapes) {
+    let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
+    for (const s of shapes) {
+      for (const p of s.points) {
+        if (p[0] < minX) minX = p[0];
+        if (p[0] > maxX) maxX = p[0];
+        if (p[1] < minY) minY = p[1];
+        if (p[1] > maxY) maxY = p[1];
+      }
+    }
+    if (!isFinite(minX)) return null;
+    return [(minX + maxX) / 2, (minY + maxY) / 2];
+  }
+
+  /* The three group transforms. Each is ONE undo step for the whole group, and
+   * each reuses applyShiftToShape unchanged — so a grouped parcel accumulates
+   * the same reviewable, resettable shift record a singly-moved one does, and
+   * the geometry engine sees nothing new. Sharing one `delta` (translation) or
+   * one origin (rotation, scaling) is the whole of what makes it a group:
+   * every parcel gets the identical transform, so relative arrangement,
+   * shape, size and orientation within the group are preserved by
+   * construction rather than by a check afterwards. */
+  function moveShapesBy(shapes, dx, dy, label) {
+    if (!shapes.length || (!dx && !dy)) return false;
+    const before = crossingSnapshot();
+    commit(label || `move ${shapes.length} parcel(s)`);
+    const delta = GeomEdit.shiftForTranslation(dx, dy);
+    for (const shape of shapes) applyShiftToShape(shape, delta);
+    reportNewCrossings(before, shapes.length > 1 ? 'Moving those parcels' : 'Moving that parcel');
+    autosave(); draw(); renderWidget();
+    return true;
+  }
+
+  function rotateShapesBy(shapes, degrees) {
+    if (!shapes.length || !isFinite(degrees) || degrees === 0) return false;
+    const c = selectionOrigin(shapes);
+    if (!c) return false;
+    const before = crossingSnapshot();
+    commit(`rotate ${shapes.length} parcel(s) by ${degrees}°`);
+    const delta = GeomEdit.shiftForRotationAbout(degrees, c);
+    for (const shape of shapes) applyShiftToShape(shape, delta);
+    reportNewCrossings(before, 'Rotating those parcels');
+    autosave(); draw(); renderWidget();
+    return true;
+  }
+
+  function scaleShapesBy(shapes, factor) {
+    if (!shapes.length || !isFinite(factor) || factor <= 0 || factor === 1) return false;
+    const c = selectionOrigin(shapes);
+    if (!c) return false;
+    const before = crossingSnapshot();
+    commit(`scale ${shapes.length} parcel(s) by ${factor}`);
+    const delta = GeomEdit.shiftForScaleAbout(factor, c);
+    for (const shape of shapes) applyShiftToShape(shape, delta);
+    reportNewCrossings(before, 'Scaling those parcels');
+    autosave(); draw(); renderWidget();
+    return true;
+  }
+
   function ensureBackup(shape) {
     if (!st.backups[shape.id]) st.backups[shape.id] = shape.points.map((p) => p.slice());
   }
@@ -1704,7 +1885,7 @@
       source: shape.source, layer: shape.layer, name: shape.name, attributes: shape.attributes,
     });
     st.shapes.push(copy);
-    st.selectedShapeId = copy.id;
+    setSelection([copy.id]);
     autosave(); draw(); renderWidget();
     return copy;
   }
@@ -1774,6 +1955,40 @@
     const after = Topo.findUnsnapped(st.shapes, Number(S.snapToleranceM) || 0.5).length;
     autosave(); draw(); renderWidget();
     toastOk(`Snapped ${r.moved} vertex/vertices onto neighbouring boundaries. Unsnapped: ${before} → ${after}.`);
+  }
+
+  /* =====================================================================
+   * SNAPPING ONE PARCEL  (17.4)
+   * ---------------------------------------------------------------------
+   * The same operation as Clean-up's Snap, with a target instead of the whole
+   * collection. Clean-up's version is untouched and still does what it did.
+   *
+   * No second algorithm: Topo.snapRing is the per-ring form of the loop
+   * snapAllToNeighbours already runs, over the same Topo.snapPoint, the same
+   * S.snapToleranceM, the same vertices-before-edges preference. Passing the
+   * shape's own id as the exclusion is what makes it single-target — the
+   * neighbours are read as references and NONE of them is written, so a snap
+   * of Plot A can never move Plot B.
+   * =================================================================== */
+  function snapOneShapeToNeighbours(shape) {
+    if (!shape) return toastErr('That parcel is no longer in the project.');
+    if (st.shapes.length < 2) return toastErr('Snapping needs at least one neighbouring parcel to snap to.');
+    const tol = Number(S.snapToleranceM) || 0.5;
+    const r = Topo.snapRing(shape.points, st.shapes, tol, shape.id);
+    const moved = r.snaps.filter((s) => s.movedBy > 1e-9);
+    const label = shape.plotNo ? `Plot ${shape.plotNo}` : `Shape ${shape.id}`;
+    if (!moved.length) {
+      return toastOk(`${label} is already snapped — no corner is within ${tol} ${areaUnit() === 'px²' ? 'px' : 'm'} of a neighbour without being exactly on it.`);
+    }
+    const before = crossingSnapshot();
+    commit(`snap ${label} to its neighbours`);
+    ensureBackup(shape);
+    shape.points = r.ring;
+    refreshShapeMetrics(shape);
+    reportNewCrossings(before, 'Snapping that parcel');
+    autosave(); draw(); renderWidget();
+    const far = moved.reduce((m, s) => Math.max(m, s.movedBy), 0);
+    toastOk(`${label}: ${moved.length} corner(s) snapped onto neighbouring boundaries, the furthest by ${far.toFixed(2)} ${areaUnit() === 'px²' ? 'px' : 'm'}. Only this parcel changed. Ctrl+Z undoes it; ↺ resets it.`);
   }
 
   function currentTopology() {
@@ -2023,7 +2238,7 @@
       };
     }
 
-    st.selectedShapeId = added[added.length - 1].id;
+    setSelection([added[added.length - 1].id]);
     st.importSummary = {
       what: o.what || 'file',
       name: o.name || '',
@@ -3771,7 +3986,7 @@ details.sect .sect-b{padding:0 8px 8px}
 .item{display:flex;align-items:center;gap:5px;padding:5px 7px;font-size:11px;border-bottom:1px solid rgba(148,163,184,.14)}
 .item:last-child{border-bottom:0}
 .item .grow{flex:1;min-width:0}
-.item button{border:0;border-radius:5px;padding:2px 6px;font-size:10px;cursor:pointer;color:#fff;background:#475569}
+.item button{flex:none;border:0;border-radius:5px;padding:2px 6px;font-size:10px;cursor:pointer;color:#fff;background:#475569}
 .item button.del{background:#b91c1c}
 .item.bad{background:rgba(239,68,68,.1)}
 .item.off{opacity:.5}
@@ -3825,10 +4040,12 @@ table.coord td:first-child{width:52px}
       case 'trace': return `👉 Tap inside a parcel to trace it. Drag to pan, scroll to zoom — both still work.`;
       case 'draw': return `👉 Tap each corner (${st.drawPoints.length} so far). Ctrl+Z / Ctrl+Y. Finish when done.`;
       case 'edit': return `✥ Drag the white handles. Tap an edge to insert. Alt+tap a handle to delete.`;
-      case 'select': return `👆 Tap inside a parcel to select it. The Edit tools act on the selected parcel.`;
-      case 'move': return st.selectedShapeId
-        ? `✥ Drag the parcel to move it — the map does not move, only the parcel. Ctrl+Z undoes it.`
-        : `✥ Drag a parcel to move it bodily. Map pan and zoom still work everywhere else.`;
+      case 'select': return `👆 Tap parcels to select them. Tapping a selected one deselects it; tapping empty space clears the selection.`;
+      case 'move': return selectionIds().length > 1
+        ? `✥ Drag any of the ${selectionIds().length} selected parcels — all of them move together by the same amount. Ctrl+Z undoes it.`
+        : (st.selectedShapeId
+          ? `✥ Drag the parcel to move it — the map does not move, only the parcel. Ctrl+Z undoes it.`
+          : `✥ Drag a parcel to move it bodily. Map pan and zoom still work everywhere else.`);
       case 'calibrate': return st.calibrationPick.length === 1
         ? `📏 Now tap the other end of the distance you know.`
         : `📏 Tap the two ends of a distance you know on the drawing.`;
@@ -4013,7 +4230,7 @@ table.coord td:first-child{width:52px}
       const shifted = s.shift && !GeomEdit.isIdentityShift(s.shift)
         ? GeomEdit.describeShift(s.shift, st.backups[s.id] || s.points) : null;
       const hidden = isHidden(s.id);
-      return `<div class="item ${bad ? 'bad' : ''} ${st.selectedShapeId === s.id ? 'sel' : ''}" data-row="${s.id}">
+      return `<div class="item ${bad ? 'bad' : ''} ${isSelected(s.id) ? 'sel' : ''}" data-row="${s.id}">
         <span class="grow">${label} · ${s.points.length}v · ${(s.areaM2 || 0).toFixed(0)} ${areaUnit()}${cmp}
           ${s.source === 'imported' ? ` <span class="pill imp" title="Imported from ${esc(s.layer || 'a file')} — edited, cleaned and exported exactly like a traced parcel">${esc(s.layer || 'imported')}</span>` : ''}
           ${s.lastGcpCorrection ? ' <span class="pill ok">GCP</span>' : ''}
@@ -4021,8 +4238,9 @@ table.coord td:first-child{width:52px}
           ${bad ? ` <span class="pill bad" title="${esc(s.validity.problems.map((p) => p.message).join(' '))}">geometry</span>` : ''}
         </span>
         <button data-vis="${s.id}" title="${hidden ? 'Hidden — click to show this parcel again. Nothing was deleted.' : 'Hide this parcel from the map. It stays in the project, keeps its geometry and is still exported.'}">${hidden ? '🚫' : '👁'}</button>
-        <button data-sel="${s.id}" title="Make this the parcel the Edit tools act on">${st.selectedShapeId === s.id ? '◉' : '○'}</button>
+        <button data-sel="${s.id}" title="${isSelected(s.id) ? 'Selected — click to take this parcel out of the selection' : 'Add this parcel to the selection the Edit tools act on. Several can be selected and moved together.'}">${isSelected(s.id) ? '◉' : '○'}</button>
         <button data-edit="${s.id}">${editing ? 'Done' : 'Edit'}</button>
+        <button data-snap="${s.id}" title="Snap just this parcel onto its neighbours' boundaries. Only this parcel changes; the neighbours are read as references and left alone.">Snap</button>
         <button data-reg="${s.id}" title="Regularise just this shape">📐</button>
         ${st.backups[s.id] ? `<button data-revert="${s.id}" title="Restore the geometry from before any correction, shift or clean-up">↺</button>` : ''}
         <button class="del" data-del="${s.id}">✕</button>
@@ -4263,6 +4481,7 @@ table.coord td:first-child{width:52px}
   function editCardHtml() {
     const sel = selectedShape();
     const has = !!sel;
+    const multi = selectionIds().length;
     const shift = sel && sel.shift ? GeomEdit.describeShift(sel.shift, st.backups[sel.id] || sel.points) : null;
     const unit = areaUnit() === 'px²' ? 'px' : 'm';
 
@@ -4279,9 +4498,11 @@ table.coord td:first-child{width:52px}
         <button class="bnd15-btn sm gray" id="eAddVertex" title="Tap an edge in Move Vertex mode to insert a corner there">Add Vertex</button>
         <button class="bnd15-btn sm gray" id="eDelVertex" title="Alt+tap a corner handle in Move Vertex mode to delete it">Delete Vertex</button>
       </div>
-      <div class="dim" style="font-size:10.5px">${has
-        ? `Selected: <b>${sel.plotNo ? 'Plot ' + esc(sel.plotNo) : 'Shape ' + sel.id}</b> · ${sel.points.length} corners · ${(sel.areaM2 || 0).toFixed(1)} ${areaUnit()} · <span class="pill">${esc(sel.layer || 'Digitized')}</span>`
-        : 'Nothing selected. Press <b>Select</b> and tap a parcel, or use the Shapes list.'}</div>
+      <div class="dim" style="font-size:10.5px">${!has
+    ? 'Nothing selected. Press <b>Select</b> and tap a parcel, or use the Shapes list. Tap more parcels to add them.'
+    : (multi > 1
+      ? `Selected: <b>${multi} parcels</b> · ${selectedShapes().reduce((n, s) => n + s.points.length, 0)} corners · ${selectedShapes().reduce((a, s) => a + (s.areaM2 || 0), 0).toFixed(1)} ${areaUnit()} total. Shift, Rotate and Scale act on all ${multi} together, about one common origin. Vertex editing, Copy, Duplicate and Delete act on <b>${sel.plotNo ? 'Plot ' + esc(sel.plotNo) : 'Shape ' + sel.id}</b>, the last one selected.`
+      : `Selected: <b>${sel.plotNo ? 'Plot ' + esc(sel.plotNo) : 'Shape ' + sel.id}</b> · ${sel.points.length} corners · ${(sel.areaM2 || 0).toFixed(1)} ${areaUnit()} · <span class="pill">${esc(sel.layer || 'Digitized')}</span>`)}</div>
 
       <div class="field"><span title="Move the selected parcel by an exact amount. Positive X is east, positive Y is north.">Shift X / Y (${unit})</span>
         <input type="text" id="eDx" placeholder="0" style="width:56px">
@@ -5222,7 +5443,7 @@ table.coord td:first-child{width:52px}
       const target = selectedShape() || st.shapes[st.shapes.length - 1];
       if (!target) return toastErr('Nothing to edit yet.');
       if (st.mode === 'edit') { st.mode = 'idle'; st.editShapeId = null; }
-      else { st.mode = 'edit'; st.editShapeId = target.id; st.selectedShapeId = target.id; }
+      else { st.mode = 'edit'; st.editShapeId = target.id; setSelection([target.id]); }
       renderWidget();
     });
     on('eAddVertex', 'onclick', () => toast('In Move Vertex mode, tap an edge of the parcel to insert a corner there.', 'info', 5000));
@@ -5234,30 +5455,47 @@ table.coord td:first-child{width:52px}
       return isFinite(v) ? v : null;
     };
     on('eApplyXY', 'onclick', () => {
-      const shape = selectedShape();
-      if (!shape) return toastErr('Select a parcel first.');
+      const group = selectedShapes();
+      if (!group.length) return toastErr('Select a parcel first.');
       const dx = numFrom('eDx') || 0;
       const dy = numFrom('eDy') || 0;
       if (!dx && !dy) return toastErr('Enter an X or Y shift.');
-      moveShapeBy(shape, dx, dy, `move shape ${shape.id} by ${dx}, ${dy}`);
-      toastOk(`Shape ${shape.id} moved ${dx}, ${dy}. Ctrl+Z undoes it.`);
+      // One parcel takes the path it always took, so its behaviour, its undo
+      // label and its message are unchanged.
+      if (group.length === 1) {
+        moveShapeBy(group[0], dx, dy, `move shape ${group[0].id} by ${dx}, ${dy}`);
+        return toastOk(`Shape ${group[0].id} moved ${dx}, ${dy}. Ctrl+Z undoes it.`);
+      }
+      moveShapesBy(group, dx, dy, `move ${group.length} parcels by ${dx}, ${dy}`);
+      toastOk(`${group.length} parcels each moved ${dx}, ${dy} — the same translation, so their relative positions are unchanged. Ctrl+Z undoes it.`);
     });
     on('eApplyRot', 'onclick', () => {
-      const shape = selectedShape();
-      if (!shape) return toastErr('Select a parcel first.');
+      const group = selectedShapes();
+      if (!group.length) return toastErr('Select a parcel first.');
       const deg = numFrom('eRot');
       if (deg == null || deg === 0) return toastErr('Enter a rotation in degrees.');
-      rotateShapeBy(shape, deg);
-      toastOk(`Shape ${shape.id} rotated ${deg}° about its own centre.`);
+      if (group.length === 1) {
+        rotateShapeBy(group[0], deg);
+        return toastOk(`Shape ${group[0].id} rotated ${deg}° about its own centre.`);
+      }
+      // About ONE shared origin, so the group turns as a rigid arrangement.
+      // Rotating each parcel about its own centre instead would spin them in
+      // place and silently destroy the layout.
+      rotateShapesBy(group, deg);
+      toastOk(`${group.length} parcels rotated ${deg}° together about the centre of the selection. Their relative arrangement is unchanged.`);
     });
     on('eApplyScale', 'onclick', () => {
-      const shape = selectedShape();
-      if (!shape) return toastErr('Select a parcel first.');
+      const group = selectedShapes();
+      if (!group.length) return toastErr('Select a parcel first.');
       const f = numFrom('eScale');
       if (f == null || f <= 0) return toastErr('Enter a positive scale factor, for example 1.01.');
       if (f === 1) return toastErr('A factor of 1 changes nothing.');
-      scaleShapeBy(shape, f);
-      toastOk(`Shape ${shape.id} scaled ×${f} about its own centre. Its area changed by ${(((f * f) - 1) * 100).toFixed(2)}%.`);
+      if (group.length === 1) {
+        scaleShapeBy(group[0], f);
+        return toastOk(`Shape ${group[0].id} scaled ×${f} about its own centre. Its area changed by ${(((f * f) - 1) * 100).toFixed(2)}%.`);
+      }
+      scaleShapesBy(group, f);
+      toastOk(`${group.length} parcels scaled ×${f} together about the centre of the selection — the gaps between them scale with them. Each area changed by ${(((f * f) - 1) * 100).toFixed(2)}%.`);
     });
     on('eCopy', 'onclick', () => {
       const shape = selectedShape();
@@ -5289,7 +5527,7 @@ table.coord td:first-child{width:52px}
       st.gcps = st.gcps.filter((g) => g.shapeId !== shape.id);
       delete st.backups[shape.id];
       if (st.editShapeId === shape.id) { st.editShapeId = null; st.mode = 'idle'; }
-      st.selectedShapeId = null;
+      setSelection(selectionIds().filter((id) => id !== shape.id));
       recomputeFit(); autosave(); draw(); renderWidget();
       toastOk(`Shape ${shape.id} deleted. Ctrl+Z undoes it.`);
     });
@@ -5297,9 +5535,16 @@ table.coord td:first-child{width:52px}
     on('eToggleOrig', 'onclick', () => { st.showOriginals = !st.showOriginals; draw(); renderWidget(); });
 
     body.querySelectorAll('[data-sel]').forEach((b) => b.onclick = () => {
-      const id = +b.dataset.sel;
-      st.selectedShapeId = st.selectedShapeId === id ? null : id;
+      toggleSelection(+b.dataset.sel);
       draw(); renderWidget();
+    });
+
+    /* The row's own Snap. Bound to the id printed in the row, never to
+     * whatever happens to be selected — that is the whole point of a
+     * per-parcel control, and it is why the id is read back out of the
+     * button's own dataset at click time. */
+    body.querySelectorAll('[data-snap]').forEach((b) => b.onclick = () => {
+      snapOneShapeToNeighbours(findShape(+b.dataset.snap));
     });
 
     /* ---- drawing scale and underlay (brief §11, §12, §13) ----------- */
