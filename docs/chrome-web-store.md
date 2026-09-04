@@ -167,7 +167,7 @@ or a gist is fine — and paste the link into the dashboard.
 
 > ### Privacy Policy — Cadastral Digitizer
 >
-> *Last updated: [date]*
+> *Last updated: 4 September 2026*
 >
 > **Cadastral Digitizer does not collect, store, transmit or sell any personal
 > information.**
@@ -198,7 +198,7 @@ or a gist is fine — and paste the link into the dashboard.
 >
 > **Contact**
 >
-> [your contact email] · Source code: https://github.com/emailofsalim/Cadastral-Digitizer
+> emailofsalim@gmail.com · Source code: https://github.com/emailofsalim/Cadastral-Digitizer
 
 ---
 
