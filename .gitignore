@@ -10,11 +10,17 @@ package-lock.json
 # Store packages built by `npm run package`. Build output is regenerable and
 # stays out of the repository — with one deliberate exception below: the exact
 # archive submitted to the Chrome Web Store, kept so the uploaded bytes can be
-# identified later. Each release that is worth keeping needs its own line here,
-# rather than tracking every rebuild: a zip does not delta-compress, so every
-# committed build adds its full size to history permanently.
+# identified later. A zip does not delta-compress, so every committed build
+# adds its full size to history permanently.
+#
+# ONE archive is tracked: the current release. Superseded ones are untracked
+# rather than accumulated — they had grown to four, 7.8 MB, of which three
+# were superseded within hours and none should be uploaded. Removing them
+# loses nothing: their bytes are already permanent in history, so an old
+# release can still be recovered exactly.
+#
+#   git show <commit>:dist/cadastral-digitizer-17.4.0.zip > recovered.zip
+#
+# On a new release, replace the line below rather than adding to it.
 dist/*
-!dist/cadastral-digitizer-17.3.3.zip
-!dist/cadastral-digitizer-17.3.4.zip
-!dist/cadastral-digitizer-17.4.0.zip
 !dist/cadastral-digitizer-17.5.0.zip
