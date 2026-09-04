@@ -23,4 +23,4 @@ package-lock.json
 #
 # On a new release, replace the line below rather than adding to it.
 dist/*
-!dist/cadastral-digitizer-17.6.0.zip
+!dist/cadastral-digitizer-17.6.1.zip
