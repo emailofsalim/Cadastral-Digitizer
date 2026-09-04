@@ -725,6 +725,73 @@ t('a picked PDF is rendered by the extension itself and reaches the raster works
   assert.strictEqual(traceEnabled, true, 'the sheet must be digitizable once it is open');
 });
 
+/* A page carrying a plot number in Helvetica, which the file NAMES but does not
+ * EMBED — one of the standard 14 fonts every PDF reader is expected to supply.
+ * `withText: false` produces the identical page without the number, as a
+ * control: the workspace letterboxes the sheet against a dark background, so a
+ * raw count of dark pixels is mostly furniture. The difference between the two
+ * is the glyphs and nothing else. */
+function pdfWithPlotNumber(withText) {
+  const content = '1 1 1 rg\n0 0 400 300 re f\n0 0 0 rg\n'
+    + (withText ? 'BT /F1 48 Tf 40 130 Td (123/4) Tj ET\n' : '');
+  const objs = [
+    '<</Type/Catalog/Pages 2 0 R>>',
+    '<</Type/Pages/Kids[3 0 R]/Count 1>>',
+    '<</Type/Page/Parent 2 0 R/MediaBox[0 0 400 300]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>',
+    `<</Length ${content.length}>>\nstream\n${content}endstream`,
+    '<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>',
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [];
+  objs.forEach((body, i) => {
+    offsets.push(pdf.length);
+    pdf += `${i + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+  for (const off of offsets) pdf += String(off).padStart(10, '0') + ' 00000 n \n';
+  pdf += `trailer\n<</Size ${objs.length + 1}/Root 1 0 R>>\nstartxref\n${xrefStart}\n%%EOF\n`;
+  return pdf;
+}
+
+const COUNT_DARK_IN_WORKSPACE = () => {
+  const c = document.querySelector('#bnd15-raster-workspace canvas');
+  if (!c) return -1;
+  const img = c.getContext('2d').getImageData(0, 0, c.width, c.height);
+  let dark = 0;
+  for (let i = 0; i < img.data.length; i += 4) {
+    if (img.data[i + 3] > 200 && img.data[i] < 90 && img.data[i + 1] < 90 && img.data[i + 2] < 90) dark++;
+  }
+  return dark;
+};
+
+t('a plot number in a font the PDF names but does not embed still renders', async () => {
+  // PDF.js can fetch character maps and standard font data from a URL, and this
+  // extension configures neither — deliberately, since that would be a network
+  // request. The question that leaves open is whether a sheet whose plot numbers
+  // use one of the standard 14 fonts comes out blank, which for a cadastral
+  // drawing would matter: the numbers are half of what is being read off it.
+  //
+  // It does not. Measured, rather than assumed, because the answer was not
+  // obvious from the configuration.
+  const { page } = await openFixtureWithExtension();
+  const blank = path.join(tmpRoot, 'no-number.pdf');
+  const numbered = path.join(tmpRoot, 'with-number.pdf');
+  fs.writeFileSync(blank, Buffer.from(pdfWithPlotNumber(false), 'latin1'));
+  fs.writeFileSync(numbered, Buffer.from(pdfWithPlotNumber(true), 'latin1'));
+
+  await importPdfThroughUi(page, blank);
+  const control = await page.evaluate(COUNT_DARK_IN_WORKSPACE);
+  await importPdfThroughUi(page, numbered);
+  const withText = await page.evaluate(COUNT_DARK_IN_WORKSPACE);
+
+  assert.ok(control > 0 && withText > 0, 'both sheets must reach the workspace');
+  assert.ok(withText - control > 2000,
+    'a plot number set in a non-embedded standard font must be visible on the sheet; '
+    + `only ${withText - control} pixels of ink appeared where the number should be, `
+    + 'which means the text rendered blank and the number cannot be read');
+});
+
 t('turning a page of a multi-page PDF replaces the sheet and keeps the digitised parcels', async () => {
   const { page } = await openFixtureWithExtension();
   const pdfPath = path.join(tmpRoot, 'three-page-sheet.pdf');

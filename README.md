@@ -9,16 +9,16 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
 **Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store. Submission answers — single purpose, permission justifications, data-usage declarations and a privacy policy — are drafted in [docs/chrome-web-store.md](docs/chrome-web-store.md).
-**Tests:** `npm test` — 585 tests. No install needed: 502 run immediately, and 83 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 586 tests. No install needed: 502 run immediately, and 84 that need a browser skip cleanly. To enable those:
 
 ```bash
 npm install --no-save jsdom            # 65 DOM integration tests
-npm install --no-save playwright-core  # 18 real-Chrome E2E tests (needs a Chrome binary)
+npm install --no-save playwright-core  # 19 real-Chrome E2E tests (needs a Chrome binary)
 ```
 
 **CI:** `.github/workflows/test.yml` runs the suite twice on every push and pull request. Once against a **bare checkout with nothing installed**, because "most of it runs the moment you unzip it" is a promise the project makes and a change could quietly break while every other check stayed green; and once with both optional dependencies plus **Playwright's own Chromium**, where **no test may skip** — a silently skipped end-to-end run must not be mistakable for a passing one.
 
-Deliberately not the runner's preinstalled Google Chrome: from **Chrome 137 the stable channel refuses `--load-extension` in headless mode**, so it loads no extension at all — `chrome://extensions` lists zero items, no service worker ever registers, and all eighteen end-to-end tests sit on their timeouts. Measured on Chrome 152; `--headless=new` and `--disable-features=DisableLoadExtensionCommandLineSwitch` were both tried and neither helps. Playwright's build has no such restriction and is the same engine, so nothing is given up.
+Deliberately not the runner's preinstalled Google Chrome: from **Chrome 137 the stable channel refuses `--load-extension` in headless mode**, so it loads no extension at all — `chrome://extensions` lists zero items, no service worker ever registers, and all nineteen end-to-end tests sit on their timeouts. Measured on Chrome 152; `--headless=new` and `--disable-features=DisableLoadExtensionCommandLineSwitch` were both tried and neither helps. Playwright's build has no such restriction and is the same engine, so nothing is given up.
 
 ---
 
@@ -129,6 +129,8 @@ Four ways in:
 - **Multi-page PDFs** get a page selector. Only the page you are on is rendered — rasterising a whole document at tracing resolution is how a tab runs out of memory. Turning a page replaces the sheet underneath and **keeps everything you have digitised**.
 - **Very large pages are capped** at 40 megapixels and 12000 px per side, and you are told when that happened rather than being quietly handed a lower-resolution sheet.
 - The bytes decide whether a file is a PDF, not its name: extensions and MIME types are both routinely wrong on files that arrive by email or a messaging app.
+- **Plot numbers render even when the sheet does not embed its font.** PDF.js can fetch character maps and standard font data over the network, and this extension configures neither — so whether a sheet using one of the standard 14 fonts came out with blank text was an open question, and on a cadastral drawing the numbers are half of what is being read. Measured rather than assumed: it renders. The one case that would not is text using a predefined CJK character map, which a cadastral sheet does not.
+- **A failed import costs you nothing.** Pick the wrong file by accident and the refusal is all that happens: the sheet you had open stays open, still paginated, still exactly where you left it.
 
 **Capture view is still there**, for two cases the renderer cannot serve: a map canvas too cross-origin-protected to read, and a PDF already open in Chrome's own viewer — PDFium's pixels are unreachable to an extension, so a capture is the only way in. The honest limitation of a capture is that it is **screen** resolution, not source resolution: zoom up first, and take a large sheet in sections. If you have the file, use **📄 PDF** instead.
 
@@ -394,7 +396,7 @@ lib/importers.js       DXF, KML/KMZ, GeoJSON and CSV readers
 lib/geom_edit.js       move/rotate/scale, the shift record, RF + scale-bar calibration
 vendor/                PDF.js, vendored verbatim (Apache-2.0) — the only third-party
                        code shipped; injected on demand, never fetched
-test/                  585 tests — npm test
+test/                  586 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```
@@ -433,13 +435,13 @@ Everything in `lib/` is pure — no DOM, no map object — so the code the exten
 
 **A note on settings.** Two settings were found carrying their weight in name only. `showValidityWarnings` had no control and nothing read it — it promised control over behaviour that did not exist, so it is gone; flagging a self-intersecting ring is a correctness signal and not the sort of thing a checkbox should be able to silence. `bboxLeakWarnPct` was likewise dead, but the check it named turned out to be worth building, so it now does what it always claimed. A test asserts that every setting is both read by the code and reachable from the panel, or else appears on a short list of deliberate internals — so a setting cannot quietly become decoration again.
 
-**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 585 every time.
+**A note on the runner.** `--test-force-exit` was removed in 16.3.0. It had been added to stop the runner hanging on jsdom timers and Playwright contexts, but once those were being closed properly it was no longer needed — and it was quietly truncating the TAP output: consecutive runs of an unchanged suite reported three different totals in the low 400s. A run that can silently drop results can silently drop a *failure*, which defeats the purpose of having a suite at all. It now runs to completion in about 15 seconds and reports the same 586 every time.
 
 ---
 
 ## What is verified, and what is not
 
-**Verified by test (585, run with `npm test`):**
+**Verified by test (586, run with `npm test`):**
 
 - **The extension installed in real Chrome.** `test/chrome_e2e.test.js` loads the actual unpacked extension into headless Chrome via Playwright and exercises the parts no simulation can reach:
   - `chrome.scripting.executeScript` with `world: 'MAIN'` really injecting the libraries into the page's own JS world, in the right order — checked by having the *page* look for them.
@@ -451,6 +453,7 @@ Everything in `lib/` is pure — no DOM, no map object — so the code the exten
   - **Turning a page of a multi-page PDF**: a parcel is drawn on page 1, the page is turned, page 2's rectangle is confirmed on screen, page 1's confirmed gone — and the drawn parcel is still there, which is what `preserveSession` exists for.
   - **A failed import costs the operator nothing.** With a good PDF open, a portal's login page saved as `.pdf` is picked: the refusal is shown *and* the open document is still there, still paginated, and still renders when paged. This one found a real defect — the failure path was closing the document already open — and it is the test that keeps it fixed.
   - **Repeated imports**: PDF, then another PDF, then an image. The page selector describes the document actually open and retires when an image replaces it, and three imports leave exactly one workspace behind rather than stacking them.
+  - **A plot number in a font the PDF names but does not embed**, measured against an identical sheet without the number so the workspace's own furniture cancels out. Standard-14 text renders; the test fails loudly with `0 pixels of ink` if it ever stops.
   - **A real PDF in Chrome's own PDFium viewer**, captured, decoded, mounted as a workspace, and its rectangle confirmed present in the pixels — the fallback path, for a PDF that is already open rather than to hand as a file.
   - The badge count crossing three contexts: page world → isolated content script → service worker.
   - A real download, parsed back as GeoJSON with coordinates checked to fall in Jharkhand.
