@@ -1,4 +1,4 @@
-# Cadastral Digitizer — v17.5.0
+# Cadastral Digitizer — v17.6.0
 
 **Developed by Md Salim Ansari** · MIT licence (see [LICENSE](LICENSE))
 
@@ -9,7 +9,7 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
 **Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store. Submission answers — single purpose, permission justifications, data-usage declarations and a privacy policy — are drafted in [docs/chrome-web-store.md](docs/chrome-web-store.md).
-**Tests:** `npm test` — 664 tests. No install needed: 539 run immediately, and 125 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 681 tests. No install needed: 548 run immediately, and 133 that need a browser skip cleanly. To enable those:
 
 ```bash
 npm install --no-save jsdom            # 80 DOM integration tests
@@ -426,9 +426,24 @@ Two problems that no amount of GCP correction fixes, because they are not georef
 
 Turned on, with a parcel selected and a colour picked: zoom into a boundary and that parcel's *visible* corners settle onto the picked colour's edge. Zoom somewhere else and that section settles too. This is progressive local refinement — the rest of the parcel is never touched, and the view is never retraced.
 
-**It only ever moves existing corners.** It cannot insert or delete one. That is the smallest geometry change that can express "the boundary is actually here", and it makes two classes of bug impossible rather than merely unlikely: the vertex count cannot grow however many times an area is inspected, and a parcel cannot be quietly rebuilt into something you did not draw.
+**Run it on demand, or let it run itself.** `⚡ Auto-fix boundary` under Edit does one pass over whatever is on screen right now — zoom to a stretch of boundary, press it, done. It ignores the toggle and the zoom floor, because those exist to decide when the *automatic* pass is worth its cost, and pressing a button already answers that. Nothing else is relaxed: no picked colour, no selected parcel, an edit in progress or unreadable pixels all refuse exactly as before, and the refusal is stated rather than silent.
 
-The evidence is a straight scan through the corner along its own boundary normal, classified with **the same `colorDistanceSq` the flood fill uses** and the tolerance from the existing slider — there is no second colour detector and no second idea of what "the same parcel" means. A refinement is offered only when that scan reads as one clean crossing:
+**It adds the corners a shape is missing, not just moves the ones it has.** Moving corners can only ever make a polygon a better version of the polygon it already is — a four-corner box traced over a parcel with a step in one side has nowhere to put the step, however well those four corners are placed. So the pass probes the middle of each edge, and where the real boundary is measurably off the straight line between its endpoints, it puts a corner where the boundary actually is and recurses into the two halves. It is Douglas–Peucker run backwards: instead of dropping vertices that add no shape, it adds the ones that do.
+
+The decision to insert reuses the same refusals, with the insert tolerance as the settle distance — a midpoint whose boundary is already on the chord reports "settled" and nothing is added. **Four independent limits stop it running away**, because vertex explosion is the failure mode that would make this unusable on a real sheet:
+
+| Limit | Bounds |
+|---|---|
+| *Add corner when off by* | a boundary already followed within tolerance gets nothing — so a second pass adds nothing, and the process converges |
+| *Minimum corner spacing* | how dense the outline can become, independently of the tolerance |
+| *Subdivision depth* | recursion is finite by construction |
+| *Max new corners per pass* | a hard budget, so even a pathological raster is bounded |
+
+Checked rather than argued: across **324 combinations** of shape, tolerance, spacing, depth and budget, run eight passes each, the vertex count stabilised every time and never once kept growing. The worst case turned a 4-corner box into 21 vertices on a sawtooth boundary — and then stopped.
+
+Turn *Add missing corners* off and the behaviour is exactly what it was: corners move, the count cannot change.
+
+The evidence is a straight scan through the corner along its own boundary normal, classified with **the same `colorDistanceSq` the flood fill uses** and the tolerance from the existing slider. The crossing is located to **better than a pixel** by interpolating the colour distance either side of it, rather than snapping to the nearer pixel centre — which matters on the soft, anti-aliased edges a scanned sheet actually has — there is no second colour detector and no second idea of what "the same parcel" means. A refinement is offered only when that scan reads as one clean crossing:
 
 | Refused when | Because |
 |---|---|
@@ -518,7 +533,7 @@ lib/geom_edit.js       move/rotate/scale, the shift record, RF + scale-bar calib
 lib/shapefile.js       ESRI Shapefile reader — .shp / .dbf / .prj, and the ZIP
 vendor/                PDF.js, vendored verbatim (Apache-2.0) — the only third-party
                        code shipped; injected on demand, never fetched
-test/                  664 tests — npm test
+test/                  681 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```

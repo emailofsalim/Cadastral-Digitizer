@@ -2495,7 +2495,8 @@ t('every precondition is checked before any geometry is considered', async () =>
   // than inferred from behaviour that happens not to trigger.
   const fn = codeOnly(PAGE_SRC.match(/function autoDigitizeBlocker\([\s\S]*?\n {2}\}/)[0]);
   for (const [needle, why] of [
-    [/if \(!S\.autoDigitize\) return 'off'/, 'the setting must be the first gate'],
+    [/if \(!manual && !S\.autoDigitize\) return 'off'/,
+      'the setting must gate the AUTOMATIC path; only a deliberate button press may bypass it'],
     [/gesture && gesture\.drag/, 'a drag in progress must block it — manual work has priority'],
     [/st\.drawPoints\.length/, 'a half-drawn outline must block it'],
     [/!st\.pickedColor/, 'no picked colour means no reference and no refinement'],
@@ -2503,6 +2504,20 @@ t('every precondition is checked before any geometry is considered', async () =>
     [/autoDigitizeMinZoom/, 'low zoom must block it'],
   ]) {
     assert.match(fn, needle, why);
+  }
+  // The on-demand button relaxes exactly two things and nothing else. The zoom
+  // floor is about cost and the toggle is about consent; both are answered by
+  // the operator pressing the button. Every SAFETY refusal is above the
+  // early return, so the manual path cannot reach geometry without them.
+  const early = fn.indexOf('if (manual) return null;');
+  assert.ok(early > 0, 'the manual path must return before the zoom floor');
+  const beforeManual = fn.slice(0, early);
+  for (const [needle, why] of [
+    [/gesture && gesture\.drag/, 'a drag in progress must still block the button'],
+    [/!st\.pickedColor/, 'no picked colour must still block the button'],
+    [/selectedShape\(\)/, 'no selected parcel must still block the button'],
+  ]) {
+    assert.match(beforeManual, needle, why);
   }
 });
 
@@ -2520,30 +2535,52 @@ t('the automatic pass writes through the ordinary history, not a private one', a
     'a local refinement must be ONE undo step, not one per corner');
   // And nothing is committed when nothing is found, so a fruitless pass leaves
   // no entry in the history at all.
-  const gate = fn.indexOf('if (!moves.length) return 0;');
+  const gate = fn.indexOf('if (!out.moved && !out.inserted)');
   assert.ok(gate > 0 && gate < fn.indexOf('commit('),
     'the empty-result return must come BEFORE the commit');
 });
 
-t('the automatic pass only ever moves existing corners', async () => {
-  // The structural guarantee behind "no vertex accumulation" and "never
-  // rebuilds the polygon": the ring is copied and indices are overwritten.
-  // Nothing splices, pushes or re-traces.
+t('the pass never builds geometry of its own — every corner comes from the measured ring', async () => {
+  // 17.5.0 asserted the vertex count could not change, because the pass could
+  // only move corners. 17.6 adds them deliberately, so that assertion is no
+  // longer the truth to protect. What replaces it is the guarantee that still
+  // matters: the page does not INVENT geometry. It hands the ring to the
+  // measured refinement and takes back what that returns — it never splices,
+  // interpolates or re-traces a corner into existence on its own.
   const fn = codeOnly(PAGE_SRC.match(/function runAutoDigitizePass\([\s\S]*?\n {2}\}/)[0]);
-  assert.match(fn, /const pts = shape\.points\.map\(\(p\) => p\.slice\(\)\)/,
-    'it must work from a copy of the existing ring');
-  assert.match(fn, /pts\[m\.index\] = m\.point/,
-    'and assign in place, so the vertex count cannot change');
-  for (const forbidden of [/\.splice\(/, /pts\.push\(/, /traceRegion/, /makeShape\(/]) {
+  assert.match(fn, /Tracer\.refineRingToEdge\(raster, ringPx, refineOpts\)/,
+    'the ring must come from the measured refinement, in one call');
+  assert.match(fn, /shape\.points = mapRing/,
+    'and be adopted whole, rather than patched vertex by vertex');
+  for (const forbidden of [/\.splice\(/, /traceRegion/, /makeShape\(/, /simplifyRing/]) {
     assert.ok(!forbidden.test(fn),
-      `the automatic pass must not ${forbidden}; it refines, it does not retrace`);
+      `the pass must not ${forbidden}; it refines a parcel, it does not retrace one`);
+  }
+  // A vertex that will not convert abandons the pass. Dropping it would leave a
+  // ring quietly missing a corner, which is worse than changing nothing.
+  assert.match(fn, /if \(!mapPt \|\| !isFinite\(mapPt\[0\]\) \|\| !isFinite\(mapPt\[1\]\)\) return 0;/,
+    'an unconvertible vertex must abandon the pass, not be silently dropped');
+});
+
+t('every limit on added corners is an operator setting, not a constant', async () => {
+  // Insertion is the part that could run away, so each of the four independent
+  // brakes has to be reachable and tunable rather than baked in.
+  const fn = codeOnly(PAGE_SRC.match(/function runAutoDigitizePass\([\s\S]*?\n {2}\}/)[0]);
+  for (const [key, why] of [
+    ['autoDigitizeInsert', 'adding corners at all must be switchable'],
+    ['autoDigitizeInsertPx', 'the deviation that justifies a corner must be tunable'],
+    ['autoDigitizeMinSpacingPx', 'the minimum spacing bounds density independently'],
+    ['autoDigitizeMaxInsert', 'the per-pass budget must be tunable'],
+    ['autoDigitizeDepth', 'the recursion depth must be tunable'],
+  ]) {
+    assert.match(fn, new RegExp(`S\\.${key}\\b`), why);
   }
 });
 
 t('it reads pixels without weakening any security handling', async () => {
   const fn = codeOnly(PAGE_SRC.match(/function runAutoDigitizePass\([\s\S]*?\n {2}\}/)[0]);
   // A tainted canvas is a refusal, not a problem to route around.
-  assert.match(fn, /catch \(e\) \{ return 0; \}/,
+  assert.match(fn, /catch \(e\) \{[\s\S]*?return 0;[\s\S]*?\}/,
     'an unreadable canvas must simply mean no refinement');
   assert.ok(!/captureVisibleTab|requestTabCapture|crossOrigin/.test(fn),
     'it must not reach for the capture path or touch cross-origin handling');
@@ -2606,4 +2643,118 @@ t('the panel says why nothing is happening', async () => {
   assert.match(fn, /autoDigitizeBlocker\(\)/, 'the status must come from the real gate');
   assert.match(fn, /needs \$\{S\.autoDigitizeMinZoom\}/,
     'and name the zoom it is waiting for rather than just saying "waiting"');
+});
+
+/* =====================================================================
+ * v17.6 — AUTO-FIX ON DEMAND, ADDED CORNERS, AND A GUIDE THAT KEEPS UP
+ * =================================================================== */
+
+t('Edit carries a dedicated Auto-fix button, disabled until it can act', async () => {
+  const ctx = await withOneShape();
+  const btn = q(ctx.widget, '#eAutoFix');
+  assert.ok(btn, 'the button must exist under Edit');
+  // Nothing selected and no colour picked yet: it must not pretend to be ready.
+  assert.strictEqual(btn.disabled, true,
+    'it must be disabled until there is both a selected parcel and a picked colour');
+  assert.match(bodyText(ctx.widget), /Pick/,
+    'and the panel must say what is missing');
+});
+
+t('Auto-fix explains the refusal rather than failing silently', async () => {
+  // The jsdom canvas cannot supply pixels, which is exactly the cross-origin
+  // case on a real portal. Pressing the button must SAY so.
+  const ctx = await withOneShape();
+  click(q(ctx.widget, '[data-sel]'));
+  await settle(2);
+  const before = JSON.stringify(sessionOrEmpty(ctx.win).shapes[0].points);
+
+  // Give it a picked colour the way the Pick handler does.
+  ctx.win.eval('document.dispatchEvent(new CustomEvent("bnd15-test-noop"))');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'page_inject.js'), 'utf8');
+  assert.match(src, /st\.pickedColor = \{ r: parseInt/, 'Pick must be the only colour source');
+
+  click(q(ctx.widget, '#eAutoFix'));
+  await settle(6);
+  assert.strictEqual(JSON.stringify(sessionOrEmpty(ctx.win).shapes[0].points), before,
+    'a refusal must leave the geometry exactly as it was');
+});
+
+t('the on-demand path ignores the toggle and the zoom floor, and nothing else', async () => {
+  const fn = codeOnly(PAGE_SRC.match(/function autoDigitizeBlocker\([\s\S]*?\n {2}\}/)[0]);
+  // Two relaxations, both justified by the operator pressing a button.
+  assert.match(fn, /if \(!manual && !S\.autoDigitize\) return 'off'/);
+  assert.match(fn, /if \(manual\) return null;/);
+  // And the zoom floor is the LAST thing, so it is all the manual path skips.
+  assert.ok(fn.indexOf('if (manual) return null;') < fn.indexOf('autoDigitizeMinZoom'),
+    'the manual return must sit immediately before the zoom floor');
+  assert.ok(fn.indexOf('autoDigitizeMinZoom') > 0);
+  // The button is wired to the manual path, not to a second implementation.
+  assert.match(PAGE_SRC, /runAutoDigitizePass\(\{ manual: true \}\)/,
+    'the button must call the same pass, with one flag');
+  assert.strictEqual((PAGE_SRC.match(/function runAutoDigitizePass\(/g) || []).length, 1,
+    'there must be exactly one implementation of the pass');
+});
+
+t('the workflow guide follows the tool that is actually selected', async () => {
+  // It said the same four things since v17 while the toolbar grew. Each mode
+  // must now describe the tool in the operator's hand.
+  const ctx = await withOneShape();
+
+  click(q(ctx.widget, '#eSelect'));
+  await settle(3);
+  assert.match(bodyText(ctx.widget), /Select — choose what the Edit tools act on/,
+    'Select must explain itself');
+  assert.match(bodyText(ctx.widget), /tap it again to remove it/,
+    'including the toggle behaviour that is not obvious');
+
+  click(q(ctx.widget, '#eMove'));
+  await settle(3);
+  assert.match(bodyText(ctx.widget), /Move Geometry — reposition without redrawing/);
+  assert.match(bodyText(ctx.widget), /already selected/,
+    'and the group-versus-single rule a drag depends on');
+
+  click(q(ctx.widget, '#eVertex'));
+  await settle(3);
+  assert.match(bodyText(ctx.widget), /Move Vertex — correct one corner/);
+
+  // The four job stages must survive alongside it — they are what the guide
+  // was for in the first place.
+  for (const stage of ['Digitise the parcels', 'Correct the position', 'Check and export']) {
+    assert.ok(bodyText(ctx.widget).includes(stage), `the job stages must remain: ${stage}`);
+  }
+});
+
+t('the guide names what Auto-fix is still missing', async () => {
+  const ctx = await withOneShape();
+  const text = bodyText(ctx.widget);
+  assert.match(text, /Auto-fix boundary/, 'the guide must mention the tool at all');
+  assert.match(text, /no colour picked|Pick/,
+    'and say which precondition is unmet rather than just listing the button');
+});
+
+t('every automatic-digitization dial is reachable from Settings', async () => {
+  const { widget, win } = await boot();
+  click(q(widget, '#advT'));
+  await settle(3);
+  // Turn insertion on so its dependent dials render.
+  const ins = q(widget, '#sAutoDigIns');
+  assert.ok(ins, 'the add-corners toggle must exist');
+  if (!ins.checked) { ins.checked = true; ins.dispatchEvent(new win.Event('change', { bubbles: true })); await settle(3); }
+  for (const id of ['sAutoDigSearch', 'sAutoDigSettle', 'sAutoDigSub', 'sAutoDigIns',
+    'sAutoDigInsPx', 'sAutoDigSpace', 'sAutoDigMaxIns', 'sAutoDigDepth']) {
+    assert.ok(q(widget, '#' + id), `Settings must expose #${id}`);
+  }
+});
+
+t('turning off Add missing corners restores the move-only behaviour', async () => {
+  const { widget, win } = await boot();
+  click(q(widget, '#advT'));
+  await settle(3);
+  const ins = q(widget, '#sAutoDigIns');
+  ins.checked = false;
+  ins.dispatchEvent(new win.Event('change', { bubbles: true }));
+  await settle(4);
+  assert.strictEqual(JSON.parse(win.localStorage.getItem('bnd15.settings')).autoDigitizeInsert, false);
+  assert.strictEqual(q(widget, '#sAutoDigInsPx'), null,
+    'its dependent dials must disappear with it');
 });

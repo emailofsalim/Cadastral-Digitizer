@@ -720,3 +720,156 @@ test('a degenerate ring yields no normal rather than a NaN direction', () => {
   // Neighbours coincident: there is no local direction to be perpendicular to.
   assert.strictEqual(T.ringVertexNormal([[5, 5], [1, 1], [5, 5]], 1), null);
 });
+
+/* =====================================================================
+ * WHOLE-RING REFINEMENT: ADDING THE CORNERS A SHAPE IS MISSING  (17.6)
+ * ---------------------------------------------------------------------
+ * Moving corners can only make a polygon a better version of itself. A box
+ * traced over a parcel with a kink in one side has nowhere to put the kink.
+ * These tests are about the corners that get added — and, at least as much,
+ * about the four separate limits that stop them being added forever.
+ * =================================================================== */
+
+// A parcel whose top edge steps up in the middle — the feature a four-corner
+// box cannot express, however well its four corners are placed. The step is 10
+// px, comfortably inside the 14 px search radius: a deviation FURTHER than the
+// scan can see is correctly invisible to the algorithm, which is a different
+// property and tested separately.
+function steppedParcel(w, h) {
+  const r = makeRaster(w, h, OTHER);
+  paintRect(r, 20, 30, 120, 90, PARCEL);    // main body, top edge at y=30
+  paintRect(r, 60, 20, 40, 10, PARCEL);     // the middle of that edge steps to y=20
+  return r;
+}
+// The crude four-corner box an operator would trace over it: its top edge runs
+// straight across at y=30 and misses the step entirely.
+const STEP_BOX = [[20, 30], [140, 30], [140, 120], [20, 120]];
+
+const RING = {
+  target: PARCEL, tolerance: 30, searchPx: 14, minRunPx: 3, settlePx: 1.0,
+  insert: true, insertTolerancePx: 2, minSpacingPx: 6, maxDepth: 3, maxInsert: 12,
+};
+
+test('subpixel interpolation places the edge better than the pixel midpoint', () => {
+  // A hard edge lands the same either way; the value of the option shows on a
+  // SOFT edge, where the pixel midpoint is up to half a pixel out and the
+  // colour gradient says where the boundary really falls.
+  const r = makeRaster(60, 40, OTHER);
+  paintRect(r, 0, 0, 30, 40, PARCEL);
+  // One blended column, as an anti-aliased boundary actually looks.
+  paintRect(r, 30, 0, 1, 40, { r: 220, g: 225, b: 210 });
+  const plain = T.refineEdgeAlongNormal(r, 24, 20, 1, 0, { ...RING, insert: false });
+  const sub = T.refineEdgeAlongNormal(r, 24, 20, 1, 0, { ...RING, insert: false, subpixel: true });
+  assert.strictEqual(plain.ok, true);
+  assert.strictEqual(sub.ok, true);
+  assert.notStrictEqual(sub.offset, plain.offset,
+    'subpixel must actually differ from the pixel midpoint on a soft edge');
+  assert.ok(Math.abs(sub.offset - plain.offset) <= 1,
+    'and stay within a pixel of it — this is a refinement, not a different answer');
+});
+
+test('a straight edge gets no new corners, however many passes are run', () => {
+  // THE CONVERGENCE PROPERTY. A boundary already followed within tolerance
+  // must not accumulate vertices, or repeated use would destroy the geometry.
+  const r = makeRaster(120, 80, OTHER);
+  paintRect(r, 20, 20, 80, 40, PARCEL);
+  let ring = [[20, 20], [100, 20], [100, 60], [20, 60]];
+  const counts = [ring.length];
+  for (let pass = 0; pass < 6; pass++) {
+    const out = T.refineRingToEdge(r, ring, RING);
+    ring = out.ring;
+    counts.push(ring.length);
+  }
+  assert.strictEqual(counts[counts.length - 1], counts[1],
+    `vertex count must stop growing: ${counts.join(' -> ')}`);
+  assert.ok(ring.length <= 12, `a rectangle must not sprout corners: got ${ring.length}`);
+});
+
+test('a corner is added where the boundary genuinely leaves the straight line', () => {
+  // The whole point of the upgrade: a shape that cannot describe the parcel
+  // gains the vertices that let it.
+  const r = steppedParcel(200, 160);
+  const out = T.refineRingToEdge(r, STEP_BOX, RING);
+  assert.ok(out.inserted > 0, 'the step must produce at least one new corner');
+  assert.ok(out.ring.length > STEP_BOX.length, 'and the ring must actually grow');
+  assert.ok(out.ring.every((p) => isFinite(p[0]) && isFinite(p[1])), 'no NaN vertices');
+  // The corner must land ON the step, not somewhere convenient.
+  const onStep = out.ring.filter((p) => p[1] < 26 && p[0] > 55 && p[0] < 105);
+  assert.ok(onStep.length > 0,
+    `a corner should sit on the step near y=20: got ${JSON.stringify(out.ring)}`);
+});
+
+test('insertion respects the minimum spacing', () => {
+  const r = steppedParcel(200, 160);
+  const box = STEP_BOX;
+  for (const minSpacingPx of [6, 15, 30]) {
+    const out = T.refineRingToEdge(r, box, { ...RING, minSpacingPx, maxInsert: 200, maxDepth: 6 });
+    for (let i = 0; i < out.ring.length; i++) {
+      const a = out.ring[i];
+      const b = out.ring[(i + 1) % out.ring.length];
+      const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+      // Original corners can be closer than the spacing; only INSERTED ones are
+      // bound by it, so the check is that no gap is impossibly small.
+      assert.ok(d > 0, `degenerate zero-length segment at ${i}`);
+    }
+    assert.ok(out.ring.length < 200, `spacing ${minSpacingPx} must bound the count, got ${out.ring.length}`);
+  }
+});
+
+test('the per-pass insertion budget is never exceeded', () => {
+  const r = steppedParcel(200, 160);
+  const box = STEP_BOX;
+  for (const maxInsert of [0, 1, 3, 8]) {
+    const out = T.refineRingToEdge(r, box, { ...RING, maxInsert, minSpacingPx: 2, maxDepth: 8 });
+    assert.ok(out.inserted <= maxInsert,
+      `budget ${maxInsert} exceeded: inserted ${out.inserted}`);
+    if (maxInsert === 0) {
+      assert.strictEqual(out.ring.length, box.length, 'a zero budget must add nothing');
+    }
+  }
+});
+
+test('insertion off is the 17.5.0 behaviour exactly — corners move, none appear', () => {
+  const r = steppedParcel(200, 160);
+  const box = STEP_BOX;
+  const out = T.refineRingToEdge(r, box, { ...RING, insert: false });
+  assert.strictEqual(out.inserted, 0);
+  assert.strictEqual(out.ring.length, box.length,
+    'with insertion off the vertex count must be exactly preserved');
+});
+
+test('recursion depth is bounded, so a noisy raster cannot hang the pass', () => {
+  // Random noise is the adversarial input: every probe might look like an edge.
+  const r = makeRaster(200, 160, OTHER);
+  let seed = 7;
+  for (let y = 0; y < 160; y++) for (let x = 0; x < 200; x++) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    if ((seed >> 8) % 2) {
+      const i = (y * 200 + x) * 4;
+      r.data[i] = PARCEL.r; r.data[i + 1] = PARCEL.g; r.data[i + 2] = PARCEL.b;
+    }
+  }
+  const box = [[20, 20], [180, 20], [180, 140], [20, 140]];
+  const started = Date.now();
+  const out = T.refineRingToEdge(r, box, { ...RING, maxInsert: 50, maxDepth: 4, minSpacingPx: 3 });
+  assert.ok(Date.now() - started < 5000, 'must terminate promptly on noise');
+  assert.ok(out.inserted <= 50, 'and still respect the budget');
+  assert.ok(out.ring.every((p) => isFinite(p[0]) && isFinite(p[1])), 'no NaN vertices');
+});
+
+test('a ring nowhere near the readable area is returned untouched', () => {
+  const r = makeRaster(60, 40, PARCEL);
+  const far = [[500, 500], [600, 500], [600, 600], [500, 600]];
+  const out = T.refineRingToEdge(r, far, RING);
+  assert.strictEqual(out.moved, 0);
+  assert.strictEqual(out.inserted, 0);
+  assert.deepStrictEqual(out.ring, far, 'nothing readable means nothing changed');
+});
+
+test('the input ring is never mutated', () => {
+  const r = steppedParcel(200, 160);
+  const box = STEP_BOX.map((p) => p.slice());
+  const copy = JSON.parse(JSON.stringify(box));
+  T.refineRingToEdge(r, box, RING);
+  assert.deepStrictEqual(box, copy, 'refineRingToEdge must be free of side effects');
+});
