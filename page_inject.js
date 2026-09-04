@@ -145,6 +145,12 @@
     // system, converting on the way out. Empty means "the session's own",
     // which is the default and the common case.
     exportCrsEpsg: '',
+    // Read imported files that state no coordinate system as this EPSG code.
+    // Empty means "work it out" — the file's own declaration, then the
+    // session's, then the question. A DXF has no place to record a CRS at all,
+    // so a survey office whose drawings are always in one UTM zone can set that
+    // zone once here instead of confirming it on every import.
+    importCrsEpsg: '',
     // Which collapsible sections start open. The map is the point of the
     // screen, so most of the panel starts closed (brief §7). Import and Export
     // are not in this list because they are not sections — they are two of the
@@ -353,6 +359,17 @@
     if (!S.exportCrsEpsg) return base;
     const chosen = safe(() => Crs.parseEpsg(S.exportCrsEpsg), null);
     return chosen || base;
+  }
+
+  /* The coordinate system an import is READ in when the file itself does not
+   * say. DXF is the case that needs it: the format has nowhere to record a CRS,
+   * so a drawing that is in fact UTM 44N arrives as bare numbers every time.
+   * Setting this once states that standing fact, which is not the same as
+   * guessing it — and it never overrides a file that DOES declare a system, so
+   * a shapefile's .prj still wins over the box. */
+  function importCrs() {
+    if (!S.importCrsEpsg) return null;
+    return safe(() => Crs.parseEpsg(S.importCrsEpsg), null) || null;
   }
 
   /* Shapes as the exporters should see them: workspace pixels resolved to real
@@ -1820,6 +1837,19 @@
   function resolveImportCrs(result, what) {
     const sessionCrs = isWorkspace() ? (st.georef && st.georef.crs) : st.crs;
 
+    // A file that states its own system is believed; only where it states none
+    // does the operator's standing Import choice stand in for the declaration.
+    // Substituting it HERE, as though the file had declared it, is deliberate:
+    // everything below — the conversion into the session's system, the
+    // exactness report, the refusal when the two cannot be reconciled — is then
+    // the same path a shapefile with a .prj already takes, rather than a second
+    // route that could disagree with the first. It cannot silence the question
+    // by accident either: the operator has to have chosen a system for `manual`
+    // to be anything at all.
+    const manual = result.crs ? null : importCrs();
+    const source = manual ? `chosen in Import: ${Crs.describeCrs(manual)}` : (result.crsSource || null);
+    if (manual) result = Object.assign({}, result, { crs: manual, crsSource: source });
+
     // The file declares its own system AND the session has one: convert.
     // Both ends are known, so this is arithmetic rather than a guess — the
     // same reason detectCrs refuses to invent a zone is the reason it is safe
@@ -1831,62 +1861,72 @@
       if (!plan.possible) {
         return { ok: false, error: `This ${what} cannot be converted to ${Crs.describeCrs(sessionCrs)}: ${plan.message}` };
       }
-      return { ok: true, crs: sessionCrs, adopted: false, convertFrom: result.crs, plan };
+      return { ok: true, crs: sessionCrs, adopted: false, convertFrom: result.crs, plan, manualCrs: manual, crsSource: source };
     }
 
-    if (result.crs && sessionCrs) return { ok: true, crs: sessionCrs, adopted: false };
+    if (result.crs && sessionCrs) return { ok: true, crs: sessionCrs, adopted: false, manualCrs: manual, crsSource: source };
 
-    /* The file states no coordinate system and the session has one.
-     * ------------------------------------------------------------------
-     * Adopting the session's used to be automatic, and that was a
-     * FABRICATION dressed as arithmetic — the same mistake this project
-     * refuses to make about a UTM zone. A DXF routinely carries local drawing
-     * coordinates: a site datum a few hundred units from an arbitrary origin.
-     * Read as eastings and northings those land in the Gulf of Guinea, and the
-     * parcels were overlaid there, at the wrong size, with nothing saying so.
-     *
-     * The numbers cannot say WHICH system they are in — but they can rule one
-     * out. A UTM easting is 100k-900k by the projection's own construction, so
-     * a coordinate of 250 is not one, whatever the session believes. Where the
-     * session's system is provably impossible for these numbers, the import
-     * asks instead of assuming: the same question the app already puts when
-     * neither side knows, and the parsed file is held while it does.
-     *
-     * Only a contradiction blocks it. Anything merely unusual still adopts the
-     * session CRS exactly as before, so no working import changes behaviour.
-     * ------------------------------------------------------------------ */
-    if (sessionCrs) {
-      const samples = [];
-      for (const r of (result.rings || [])) {
-        for (const pt of (r.points || [])) {
-          samples.push(pt);
-          if (samples.length >= 8) break;
-        }
-        if (samples.length >= 8) break;
-      }
-      const fam = samples.length ? safe(() => Crs.classifyFamily(samples), null) : null;
-      const impossible = fam && sessionCrs.kind === 'utm' && fam.family !== 'utm';
-      if (impossible) {
-        return {
-          ok: false,
-          ask: true,
-          note: `${(result.rings || []).length} parcel(s) were read, but their coordinates cannot be `
-            + `${Crs.describeCrs(sessionCrs)} — ${fam.reason}. That usually means the file holds local `
-            + `drawing coordinates rather than survey coordinates. Choose the system the file is really `
-            + `in; if it has none, it needs georeferencing before it can be placed on this map.`,
-          error: `This ${what} states no coordinate system, and its numbers cannot be `
-            + `${Crs.describeCrs(sessionCrs)} — ${fam.reason}. That usually means the file holds `
-            + `local drawing coordinates rather than survey coordinates. Choose the system the file is `
-            + `really in; if it has none, it needs georeferencing before it can be placed on this map.`,
-        };
-      }
-      return { ok: true, crs: sessionCrs, adopted: false };
-    }
-    if (result.crs) return { ok: true, crs: result.crs, adopted: true };
+    if (sessionCrs) return { ok: true, crs: sessionCrs, adopted: false };
+    if (result.crs) return { ok: true, crs: result.crs, adopted: true, manualCrs: manual, crsSource: source };
     return {
       ok: false,
       ask: true,
       error: `The coordinate system of this ${what} is not stated in the file and this session has not established one either. Confirm the coordinate system first — a wrong zone puts exports hundreds of kilometres out.`,
+    };
+  }
+
+  /* =====================================================================
+   * A SHIFTED DXF, PUT BACK WHERE IT BELONGS
+   * ---------------------------------------------------------------------
+   * This project's own DXF export defaults to "shift" mode: it writes true
+   * coordinates MINUS a round origin, records that origin in $INSBASE, and
+   * says so in a comment — "add these back to recover true CRS coordinates".
+   * Some CAD setups round large numbers badly, which is why the mode exists.
+   *
+   * Re-importing such a file used to land the parcels a few hundred metres
+   * from the equator, because the origin was reported and never applied. The
+   * map then followed them somewhere with no tiles and appeared to go blank.
+   * The parcels looked right against that blank background, because the view
+   * and the geometry were wrong together.
+   *
+   * Adding the origin back is not a guess. The file states it, and states what
+   * it is for. But it is applied only when it is DEMONSTRABLY the right thing:
+   * the coordinates as written must be impossible for the session's system,
+   * and adding the origin must make them possible. A file exported in
+   * "absolute" mode is unchanged, because its coordinates are already
+   * plausible and the second test fails — which is the double-shift the
+   * importer's comment warns about, and it stays prevented.
+   * =================================================================== */
+  function applyRecordedOrigin(result, crs) {
+    const origin = result && result.insBase;
+    if (!origin || !crs || !(result.rings || []).length) return null;
+
+    const sample = (rings) => {
+      const out = [];
+      for (const r of rings) {
+        for (const p of (r.points || [])) { out.push(p); if (out.length >= 8) return out; }
+      }
+      return out;
+    };
+    const raw = sample(result.rings);
+    if (!raw.length) return null;
+
+    const asWritten = safe(() => Crs.classifyFamily(raw), null);
+    const shifted = raw.map((p) => [p[0] + origin[0], p[1] + origin[1]]);
+    const withOrigin = safe(() => Crs.classifyFamily(shifted), null);
+    if (!asWritten || !withOrigin) return null;
+
+    // Only for a projected session, where the family test is decisive: a UTM
+    // easting is 100k-900k by construction, so "as written" being outside that
+    // and "with the origin" being inside it is not a coincidence.
+    if (crs.kind !== 'utm') return null;
+    if (asWritten.family === 'utm' || withOrigin.family !== 'utm') return null;
+
+    return {
+      origin,
+      rings: result.rings.map((r) => Object.assign({}, r, {
+        points: r.points.map((p) => [p[0] + origin[0], p[1] + origin[1]]),
+      })),
     };
   }
 
@@ -1896,6 +1936,20 @@
   function adoptImportedRings(result, opts) {
     const o = opts || {};
     const crsCheck = resolveImportCrs(result, o.what || 'file');
+    // Before anything is placed: a drawing exported in "shifted" mode carries
+    // the origin needed to put it back. Applied only where it demonstrably
+    // belongs — see applyRecordedOrigin.
+    let restoredOrigin = null;
+    if (crsCheck.ok) {
+      // Against the system the numbers are WRITTEN in, not the one they are
+      // headed for: the origin is added before any reprojection, so where the
+      // two differ it is the source system the magnitudes must be judged by.
+      const put = applyRecordedOrigin(result, crsCheck.convertFrom || crsCheck.crs);
+      if (put) {
+        result = Object.assign({}, result, { rings: put.rings });
+        restoredOrigin = put.origin;
+      }
+    }
     if (!crsCheck.ok) {
       if (crsCheck.ask) {
         // Neither the file nor the session states a coordinate system, so the
@@ -1954,7 +2008,7 @@
       st.crs = crsCheck.crs;
       st.crsDetection = {
         crs: crsCheck.crs, confidence: 0.9, needsConfirmation: false,
-        reasons: [`Taken from the imported ${o.what || 'file'}: ${result.crsSource || 'declared in the file'}.`],
+        reasons: [`Taken from the imported ${o.what || 'file'}: ${crsCheck.crsSource || result.crsSource || 'declared in the file'}.`],
         candidates: [],
       };
     }
@@ -1968,6 +2022,7 @@
       warnings: result.warnings || [],
       crsLabel: Crs.describeCrs(crsCheck.crs),
       adoptedCrs: !!crsCheck.adopted,
+      manualCrs: crsCheck.manualCrs ? Crs.describeCrs(crsCheck.manualCrs) : null,
       convertedFrom: crsCheck.convertFrom ? Crs.describeCrs(crsCheck.convertFrom) : null,
       conversionExact: crsCheck.plan ? crsCheck.plan.exact : null,
       conversionNote: crsCheck.plan ? crsCheck.plan.message : null,
@@ -1978,6 +2033,10 @@
     zoomToImported(added);
 
     const bits = [`${added.length} parcel(s) imported and overlaid`];
+    if (crsCheck.manualCrs) bits.push(`read as ${Crs.describeCrs(crsCheck.manualCrs)} (your Import setting)`);
+    if (restoredOrigin) {
+      bits.push(`origin ${restoredOrigin[0]}, ${restoredOrigin[1]} from the file's $INSBASE added back`);
+    }
     if (crsCheck.convertFrom) bits.push(`converted from ${Crs.describeCrs(crsCheck.convertFrom)} to ${Crs.describeCrs(crsCheck.crs)}`);
     if (st.importSummary.withPlotNo) bits.push(`${st.importSummary.withPlotNo} with a plot number`);
     if (result.skipped && result.skipped.length) bits.push(`${result.skipped.length} item(s) skipped`);
@@ -4143,6 +4202,18 @@ table.coord td:first-child{width:52px}
         ${item('iImage', 'Image (scanned sheet)', 'Digitize over a scanned cadastral drawing')}
         ${item('iPdf', 'PDF', 'Pick a PDF file; its pages are rendered by the extension itself, offline')}
         ${item('iShp', 'Shapefile', 'A zipped shapefile, or the .shp/.shx/.dbf/.prj files selected together')}
+        <div class="mcrs">
+          <label for="impCrs">Read coordinates as</label>
+          <select id="impCrs">
+            <option value="">Work it out — ask if unclear</option>
+            <option value="4326" ${S.importCrsEpsg === '4326' ? 'selected' : ''}>Longitude / latitude (WGS 84)</option>
+            <option value="3857" ${S.importCrsEpsg === '3857' ? 'selected' : ''}>Web Mercator</option>
+            ${[42, 43, 44, 45, 46, 47].map((z) => `<option value="${32600 + z}" ${S.importCrsEpsg === String(32600 + z) ? 'selected' : ''}>UTM ${z}N (metres)</option>`).join('')}
+          </select>
+          <div class="dim">${S.importCrsEpsg
+    ? `A DXF or CSV that names no system is read as ${esc(Crs.describeCrs(importCrs()) || 'this')}. A file that names its own — a shapefile’s .prj, a GeoJSON — still wins.`
+    : 'DXF has nowhere to record a coordinate system. If your drawings are always in one UTM zone, set it here once instead of confirming it on every import.'}</div>
+        </div>
       </div>
       <div class="bnd15-menu ${open === 'export' ? 'open' : ''}" id="menuExport">
         <div class="mh">Export</div>
@@ -4991,6 +5062,14 @@ table.coord td:first-child{width:52px}
         renderWidget();
       });
     }
+    on('impCrs', 'onchange', (e) => {
+      S.importCrsEpsg = e.target.value || '';
+      saveSettings();
+      renderWidget();
+      const chosen = importCrs();
+      if (!chosen) toast('Imports will be worked out from the file, then the session — and asked about when neither says.', 'info', 5000);
+      else toast(`Files that state no coordinate system will be read as ${Crs.describeCrs(chosen)}. Files that state their own are unaffected.`, 'ok', 6000);
+    });
     on('expCrs', 'onchange', (e) => {
       S.exportCrsEpsg = e.target.value || '';
       saveSettings();

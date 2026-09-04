@@ -9,7 +9,7 @@ Works on **any** portal running OpenLayers, Leaflet, MapLibre, Mapbox GL or Goog
 **Install:** `chrome://extensions` or `edge://extensions` → Developer mode → Load unpacked → select this folder.
 **Use:** open a map portal, image or PDF, click the toolbar button (or press `Ctrl+Shift+U`).
 **Package:** `npm run package` → `dist/cadastral-digitizer-<version>.zip`, ready to upload to the Chrome Web Store. Submission answers — single purpose, permission justifications, data-usage declarations and a privacy policy — are drafted in [docs/chrome-web-store.md](docs/chrome-web-store.md).
-**Tests:** `npm test` — 624 tests. No install needed: 524 run immediately, and 100 that need a browser skip cleanly. To enable those:
+**Tests:** `npm test` — 630 tests. No install needed: 527 run immediately, and 103 that need a browser skip cleanly. To enable those:
 
 ```bash
 npm install --no-save jsdom            # 80 DOM integration tests
@@ -61,7 +61,9 @@ Imported rings become **ordinary shapes**. Not a separate layer type with its ow
 
 **They are overlaid automatically.** Coordinates in the file are used as they are, so a DXF holding real eastings and northings lands where those eastings and northings are, and the *view* moves to the imported extent — never the geometry to the view.
 
-**A file that states no coordinate system is asked about, not assumed into the session's.** This was the real cause of a DXF landing in the wrong place. The import used to adopt the session's coordinate system for any file that declared none — which for a DXF in *local drawing coordinates* meant reading a site datum a few hundred units wide as UTM eastings and northings, and overlaying the parcels at the wrong place and the wrong size with nothing saying so. The numbers cannot say *which* system they are in, but they can rule one out: a UTM easting is 100 000–900 000 by the projection's own construction, so `250` is provably not one. Where the session's system is impossible for the numbers, the import now puts the same question it already asks when neither side knows — and holds the parsed file while it does, so answering finishes the import. Only a **contradiction** blocks it; anything merely unusual still adopts the session CRS exactly as before.
+**A DXF this tool exported is put back where it came from.** This was the real cause of the blank portal, and it was a bug in the *reader*. The DXF export defaults to `shift` mode: it writes true coordinates minus a round origin, records that origin in `$INSBASE`, and says in a comment to add it back — because some CAD setups round seven-digit numbers badly. Re-importing such a file landed the parcels a few hundred metres from the equator: the header scan read `$INSBASE` with a fixed eight-pair window that ran past the end of the variable and into `$EXTMIN`, so what came back was the drawing's minimum corner instead of the recorded origin. The origin was reported and never applied. The map then followed the parcels to open ocean, found no tiles, and appeared to go blank — and the drawing looked *correct* against that blank background, because the geometry and the camera were wrong together. The scan now reads to the next variable rather than a guessed distance, and the origin is added back only where it is demonstrably right: the coordinates as written must be impossible for the session's system and adding the origin must make them possible. A file exported in `absolute` mode fails that second test and is untouched, which is the double-shift the exporter's own comment warns about.
+
+**"Read coordinates as" — the standing fact, stated once.** DXF has nowhere to record a coordinate system; a drawing that is in fact UTM 44N arrives as bare numbers every time. The Import menu carries the same kind of selector the Export menu has, and it stands in for a *missing* declaration: a file that states its own system — a shapefile's `.prj`, a GeoJSON, a KML — still wins over the box, so a stale setting can never silently reinterpret one. Left on **Work it out**, the behaviour is exactly what it was: the file's declaration, then the session's, then the question. Set to a zone, the file becomes *declared* rather than unknown, which means it takes the ordinary conversion path — choose 44N in a 45N session and the geometry is converted, not relabelled.
 
 **The view moves only where there is something to look at.** A DXF routinely carries *local drawing* coordinates — a site datum a few hundred units from an arbitrary origin. Read as eastings and northings, `(250, 250)` in UTM 45N is a point on the equator off West Africa, and the import used to pan there: no tiles, blank map, parcels nowhere in sight. The parcels always imported correctly; only the camera was wrong. Now the target is checked against the session's coordinate system with the *existing* CRS engine, and where it does not name a plausible place the view stays put and says why — which is the information you need to fix the CRS.
 
@@ -481,7 +483,7 @@ lib/geom_edit.js       move/rotate/scale, the shift record, RF + scale-bar calib
 lib/shapefile.js       ESRI Shapefile reader — .shp / .dbf / .prj, and the ZIP
 vendor/                PDF.js, vendored verbatim (Apache-2.0) — the only third-party
                        code shipped; injected on demand, never fetched
-test/                  624 tests — npm test
+test/                  630 tests — npm test
 test/fixtures/         stub cadastral portal used by the E2E suite
 LICENSE                MIT
 ```

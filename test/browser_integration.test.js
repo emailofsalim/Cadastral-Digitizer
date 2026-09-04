@@ -1896,19 +1896,83 @@ t('auto-focus never reorders the shape collection', async () => {
  * Only the camera move is now conditional. The parcels import either way.
  * =================================================================== */
 
-t('a DXF in local drawing coordinates is asked about, not silently misplaced', async () => {
-  // This test previously asserted the file IMPORTED and only the view was left
-  // alone. That was the shallower fix: the parcels still entered the session
-  // with drawing units read as UTM metres, so they sat on the map at the wrong
-  // place and the wrong size. The real defect was upstream — the import
-  // ADOPTED the session's coordinate system for a file that states none.
+t('a DXF this project exported in shifted mode round-trips back to where it was', async () => {
+  // THE ACTUAL BUG behind the blank portal, and the reason the parcels looked
+  // correct while the map did not: this project's own DXF export defaults to
+  // "shift" mode. It writes true coordinates MINUS a round origin and records
+  // that origin in $INSBASE with a comment saying to add it back — because
+  // some CAD setups round large numbers badly.
   //
-  // A UTM easting is 100k-900k by the projection's own construction, so 250 is
-  // provably not one. The numbers cannot say which system they ARE in, but
-  // they can rule this one out, and the import now asks rather than assumes.
+  // Re-importing such a file used to land the parcels a few hundred metres
+  // from the equator. The view followed them there, found no tiles, and the
+  // portal appeared to go blank; the drawing looked right against it because
+  // the geometry and the camera were wrong together.
+  const { win, widget } = await boot();
+  const E = require('../lib/exporters.js');
+
+  const truth = [
+    [432500.25, 2618400.75], [432540.25, 2618400.75],
+    [432540.25, 2618440.75], [432500.25, 2618440.75],
+  ];
+  // Written exactly as the Export menu writes it: shifted, with the origin.
+  // makeDxf answers with { text, origin, mode }; the file itself is .text.
+  const built = E.makeDxf([{ id: 1, plotNo: '77/3', points: truth }], {
+    georefMode: 'shift', crsLabel: 'WGS 84 / UTM 45N',
+  });
+  const dxf = built.text;
+  assert.match(dxf, /\$INSBASE/, 'the export must actually be in shifted mode for this to test anything');
+
+  feedNextFilePicker(win, 'exported.dxf', dxf);
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iDxf'));
+  await settle(12);
+
+  const shapes = sessionOrEmpty(win).shapes;
+  assert.strictEqual(shapes.length, 1, 'the DXF must import');
+  const xs = shapes[0].points.map((p) => p[0]);
+  const ys = shapes[0].points.map((p) => p[1]);
+  // Back at the real survey coordinates, not a few hundred metres from the
+  // equator. Tolerance is a metre: the export rounds to a sane precision.
+  assert.ok(Math.min(...xs) > 432000 && Math.max(...xs) < 433000,
+    `eastings should be back near 432500, got ${Math.min(...xs)}..${Math.max(...xs)}`);
+  assert.ok(Math.min(...ys) > 2618000 && Math.max(...ys) < 2619000,
+    `northings should be back near 2618400, got ${Math.min(...ys)}..${Math.max(...ys)}`);
+});
+
+t('a DXF exported in absolute mode is never double-shifted', async () => {
+  // The importer's own comment warns about this: adding an origin back to a
+  // file that was already absolute would move it twice. The origin is applied
+  // only where the coordinates as written are impossible for the session and
+  // adding it makes them possible, so an absolute file cannot qualify.
+  const { win, widget } = await boot();
+  const E = require('../lib/exporters.js');
+  const truth = [
+    [432500.25, 2618400.75], [432540.25, 2618400.75],
+    [432540.25, 2618440.75], [432500.25, 2618440.75],
+  ];
+  const dxf = E.makeDxf([{ id: 1, points: truth }], {
+    georefMode: 'absolute', crsLabel: 'WGS 84 / UTM 45N',
+  }).text;
+  feedNextFilePicker(win, 'absolute.dxf', dxf);
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iDxf'));
+  await settle(12);
+
+  const shapes = sessionOrEmpty(win).shapes;
+  assert.strictEqual(shapes.length, 1);
+  const xs = shapes[0].points.map((p) => p[0]);
+  assert.ok(Math.min(...xs) > 432000 && Math.max(...xs) < 433000,
+    `an absolute export must import unchanged, got ${Math.min(...xs)}..${Math.max(...xs)}`);
+});
+
+t('a DXF with genuinely local coordinates and no recorded origin still imports', async () => {
+  // Nothing in the file says where it belongs, so nothing is invented: it
+  // imports exactly as it always did. Only the automatic view move is held
+  // back, so the portal is not left staring at empty tiles.
   const { win, widget } = await boot();
   const centreBefore = win.map.getView().getCenter().slice();
-
   const dxf = [
     '0', 'SECTION', '2', 'ENTITIES',
     '0', 'LWPOLYLINE', '8', 'P', '70', '1',
@@ -1917,87 +1981,131 @@ t('a DXF in local drawing coordinates is asked about, not silently misplaced', a
     '10', '340', '20', '340',
     '0', 'ENDSEC', '0', 'EOF',
   ].join('\r\n');
-
   feedNextFilePicker(win, 'site.dxf', dxf);
   click(q(widget, '#btnImport'));
   await settle(2);
   click(q(widget, '#iDxf'));
   await settle(12);
 
-  assert.strictEqual(sessionOrEmpty(win).shapes.length, 0,
-    'drawing coordinates must NOT be silently adopted as survey coordinates');
-  assert.deepStrictEqual(win.map.getView().getCenter(), centreBefore,
-    'and the portal is left exactly where the operator had it');
-
-  // The parsed file is held and the question is put, so answering finishes the
-  // import rather than making the operator find the file again.
-  const panel = win.document.getElementById('bnd15-widget').textContent;
-  assert.match(panel, /coordinate system/i, 'the operator must be asked');
-  assert.match(panel, /local drawing coordinates|cannot be/i,
-    `the reason must be stated, not just the refusal: ${panel.slice(0, 400)}`);
-});
-
-t('a DXF in real survey coordinates still moves the view as it always did', async () => {
-  // The guard must not cost a legitimate import its automatic overlay-and-look.
-  const { win, widget } = await boot();
-  const centreBefore = win.map.getView().getCenter().slice();
-
-  const dxf = [
-    '0', 'SECTION', '2', 'ENTITIES',
-    '0', 'LWPOLYLINE', '8', 'P', '70', '1',
-    '10', '432500.25', '20', '2618400.75',
-    '10', '432540.25', '20', '2618400.75',
-    '10', '432540.25', '20', '2618440.75',
-    '0', 'ENDSEC', '0', 'EOF',
-  ].join('\r\n');
-
-  feedNextFilePicker(win, 'plots.dxf', dxf);
-  click(q(widget, '#btnImport'));
-  await settle(2);
-  click(q(widget, '#iDxf'));
-  await settle(12);
-
-  assert.strictEqual(sessionOrEmpty(win).shapes.length, 1);
-  assert.notDeepStrictEqual(win.map.getView().getCenter(), centreBefore,
-    'a real import must still bring the view to the parcels');
-});
-
-t('a DXF in real survey coordinates is never questioned unnecessarily', async () => {
-  // The guard must only fire on a CONTRADICTION. Numbers that could plausibly
-  // be the session's coordinate system still adopt it silently, exactly as
-  // before — a question the operator does not need is its own kind of damage,
-  // and this is the case that must not regress.
-  const { win, widget } = await boot();
-  const dxf = [
-    '0', 'SECTION', '2', 'ENTITIES',
-    '0', 'LWPOLYLINE', '8', 'P', '70', '1',
-    '10', '432500.25', '20', '2618400.75',
-    '10', '432540.25', '20', '2618400.75',
-    '10', '432540.25', '20', '2618440.75',
-    '0', 'ENDSEC', '0', 'EOF',
-  ].join('\r\n');
-  feedNextFilePicker(win, 'plots.dxf', dxf);
-  click(q(widget, '#btnImport'));
-  await settle(2);
-  click(q(widget, '#iDxf'));
-  await settle(12);
-
   assert.strictEqual(sessionOrEmpty(win).shapes.length, 1,
-    'a plausible import must proceed without a question');
-  assert.ok(!/Which coordinate system is this file in/.test(
-    win.document.getElementById('bnd15-widget').textContent),
-  'and the operator must not be asked about a file that is already consistent');
+    'the import itself must still work — nothing is blocked');
+  assert.deepStrictEqual(win.map.getView().getCenter(), centreBefore,
+    'but the portal keeps its basemap rather than panning to empty tiles');
 });
 
-t('a lon/lat file in a lon/lat session is not blocked by the contradiction guard', async () => {
-  // The guard is narrow by design: it fires only where the session's system is
-  // provably impossible for the numbers. Degree-range coordinates in a
-  // degree-range session are consistent, so nothing should stop them.
-  const C = require('../lib/crs.js');
-  assert.strictEqual(C.classifyFamily([[86.3, 23.6], [86.4, 23.7]]).family, 'geographic');
-  // And the one that matters: small drawing units are provably not UTM.
-  assert.notStrictEqual(C.classifyFamily([[250, 250], [340, 340]]).family, 'utm',
-    'a UTM easting is 100k-900k by construction, so 250 cannot be one');
-  assert.strictEqual(C.classifyFamily([[432500, 2618400], [432540, 2618440]]).family, 'utm',
-    'and real survey coordinates must still classify as UTM');
+/* =====================================================================
+ * v17.3.3 — NAMING THE SYSTEM AN IMPORT IS READ IN
+ * ---------------------------------------------------------------------
+ * DXF has nowhere to record a coordinate system. A survey office whose
+ * drawings are always in one UTM zone was therefore confirming that same zone
+ * on every import, or relying on the session to supply it. "Read coordinates
+ * as" states the standing fact once, next to the imports, exactly as "Write
+ * coordinates in" already does for the exports.
+ *
+ * It stands in for a MISSING declaration; it never overrides a present one.
+ * =================================================================== */
+
+const setSelect = (win, el, value) => {
+  el.value = value;
+  el.dispatchEvent(new win.Event('change', { bubbles: true }));
+};
+
+t('the import menu offers a coordinate system, defaulting to automatic', async () => {
+  const { widget } = await boot();
+  const sel = q(widget, '#impCrs');
+  assert.ok(sel, 'an import CRS selector must exist');
+  assert.strictEqual(sel.value, '', 'it must default to working the system out, not to a zone');
+  const labels = Array.from(sel.options).map((o) => o.textContent);
+  assert.match(labels[0], /Work it out/, 'the default must be the automatic one');
+  assert.ok(labels.some((l) => /Longitude \/ latitude/.test(l)), 'lon/lat must be offered');
+  assert.ok(labels.some((l) => /UTM 44N/.test(l)) && labels.some((l) => /UTM 45N/.test(l)),
+    'and the same UTM zones the export selector offers');
 });
+
+t('a DXF of bare numbers is read in the zone chosen in the import menu', async () => {
+  // The stub portal is UTM 45N, so without a choice a bare DXF is adopted into
+  // 45N and its numbers stand as written. Naming 44N instead makes the file
+  // declared rather than unknown, so the import CONVERTS 44N -> 45N — which is
+  // the one thing that distinguishes a real declaration from a silent guess.
+  const { win, widget } = await boot();
+  const raw = [[800000, 2618000], [800200, 2618000], [800200, 2618200], [800000, 2618200]];
+  const dxf = ['0', 'SECTION', '2', 'ENTITIES', '0', 'LWPOLYLINE', '8', 'P', '70', '1']
+    .concat(...raw.map((p) => ['10', String(p[0]), '20', String(p[1])]))
+    .concat(['0', 'ENDSEC', '0', 'EOF']).join('\r\n');
+
+  setSelect(win, q(widget, '#impCrs'), '32644');
+  await settle(2);
+
+  feedNextFilePicker(win, 'zone44.dxf', dxf);
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iDxf'));
+  await settle(16);
+
+  const s = sessionOrEmpty(win);
+  assert.strictEqual(s.shapes.length, 1, 'the DXF must import without stopping to ask');
+  const pts = s.shapes[0].points;
+
+  // Checked against the library rather than against a number copied from a run:
+  // whatever 44N -> 45N is, that is what the stored geometry must be.
+  const C = require('../lib/crs.js');
+  const want = C.reprojectRing(raw, C.parseEpsg('32644'), C.parseEpsg('32645'));
+  assert.ok(want.ok, 'setup: the two zones must be inter-convertible');
+  for (let i = 0; i < raw.length; i++) {
+    assert.ok(Math.abs(pts[i][0] - want.points[i][0]) < 0.5
+      && Math.abs(pts[i][1] - want.points[i][1]) < 0.5,
+    `vertex ${i} should be the 44N->45N conversion ${want.points[i]}, got ${pts[i]}`);
+  }
+  assert.ok(Math.abs(pts[0][0] - raw[0][0]) > 1000,
+    'the numbers must not have been left as written — that would be the old adopt-the-session behaviour');
+});
+
+t('a file that states its own system ignores the import choice', async () => {
+  // KML declares WGS 84 by specification. The choice stands in for a missing
+  // declaration; treating it as an override would let a stale setting silently
+  // reinterpret every shapefile and GeoJSON that arrives afterwards.
+  const { win, widget } = await boot();
+  const ring = [[85.3096, 23.3441], [85.3196, 23.3441], [85.3196, 23.3541], [85.3096, 23.3541]];
+  const kml = '<kml><Document><Placemark><name>Plot 9</name>'
+    + '<Polygon><outerBoundaryIs><LinearRing><coordinates>'
+    + ring.map((p) => p.join(',')).join(' ') + ' ' + ring[0].join(',')
+    + '</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></Document></kml>';
+
+  setSelect(win, q(widget, '#impCrs'), '32644');
+  await settle(2);
+
+  feedNextFilePicker(win, 'plots.kml', kml);
+  click(q(widget, '#btnImport'));
+  await settle(2);
+  click(q(widget, '#iKml'));
+  await settle(16);
+
+  const s = sessionOrEmpty(win);
+  assert.strictEqual(s.shapes.length, 1, 'the KML must still import');
+  const pts = s.shapes[0].points;
+  // Read as lon/lat and projected into the session's 45N, as it was before the
+  // selector existed. Had the 44N choice been applied to degrees instead, the
+  // reprojection of (85.3, 23.3) metres would have landed nowhere near here.
+  const C = require('../lib/crs.js');
+  const want = C.reprojectRing(ring, C.parseEpsg('4326'), C.parseEpsg('32645'));
+  assert.ok(want.ok, 'setup: lon/lat must convert into the session zone');
+  assert.ok(Math.abs(pts[0][0] - want.points[0][0]) < 0.5
+    && Math.abs(pts[0][1] - want.points[0][1]) < 0.5,
+  `the KML's own declaration must win: expected ${want.points[0]}, got ${pts[0]}`);
+});
+
+t('the chosen import system survives a reload, like the export one', async () => {
+  // It is a standing fact about the office's drawings, not a per-file answer,
+  // so it belongs in settings rather than in the session — the same storage the
+  // export selector uses, for the same reason.
+  const { win, widget } = await boot();
+  setSelect(win, q(widget, '#impCrs'), '32645');
+  await settle(2);
+  const raw = win.localStorage.getItem('bnd15.settings');
+  assert.ok(raw, 'settings must be persisted');
+  assert.strictEqual(JSON.parse(raw).importCrsEpsg, '32645',
+    'the chosen import system must be saved');
+  assert.strictEqual(q(widget, '#impCrs').value, '32645',
+    'and the selector must show it after the re-render');
+});
+
